@@ -16,13 +16,44 @@ This project scrapes league/player pages into a **SQLite** database, then genera
 - Uses a rolling recent-performance baseline (e.g., last 3 seasons)
 - Regresses toward league average based on a configurable prior (`--k-ab`)
 - Adjusts outcomes for:
-  - **Park factors** (home park + away baseline)
+  - **Park factors** (home/away blended)
+    - computed from MLBC home/away splits
+    - optionally blended with a **Baseball Savant prior** (index_wOBA) for stability in low-sample stadium-years
   - **Batted-ball profile** (GB% impacts HR/SLG/OPS tails)
   - Variance scaling (fat/skinny tails)
 - Produces percentile outcomes:
   - OPS p10 / p50 / p90
   - HR p10 / p50 / p90
 
+
+## Park factors (MLBC + optional Savant prior)
+
+### Build / update Savant priors (CSV)
+
+```bash
+python3 savant_park_factors_to_csv.py --year 2002 --batside L --rolling 3 \
+  --stat index_wOBA --out data/savant_park_factors_prior.csv
+```
+
+### Compute MLBC park factors (with optional Savant blending)
+
+```bash
+python3 mlbc_parkfactors.py --db mlbc.sqlite \
+  --savant-prior-csv data/savant_park_factors_prior.csv \
+  --savant-k-ab 2500
+```
+
+Notes:
+- Stadium→venue mapping is automatic (normalized + fuzzy match + a small alias list in code).
+- The blended PF and diagnostics are stored in `park_factors_team_year`:
+  `pf_ops_index` (final), plus `pf_ops_index_mlbc`, `pf_ops_index_prior`, `pf_ops_blend_w`.
+
+## Free agent / destination stadium projections
+
+In Streamlit, enable **Compare vs destination team park** and choose a destination team.
+The app will show baseline results and destination deltas (OPS_p50 / HR_p50).
+
+You can also call `project_players(..., override_team="...")` directly.
 ### Interfaces
 - **CLI**: run projections for one or many player IDs
 - **Streamlit app**: interactive table and league context
