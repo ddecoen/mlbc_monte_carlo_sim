@@ -15,12 +15,53 @@ st.set_page_config(page_title="MLBC Projections", layout="wide")
 st.title("MLBCSimLeague Projections (Monte Carlo)")
 st.caption("OPS + HR distributions using recent-3 seasons, regression to league, GB% batted-ball, age curve, and home/away park factors.")
 
+from get_db import ensure_local_db_with_status, ensure_local_db
+
 with st.sidebar:
-    db_path = st.text_input("SQLite DB path", value="mlbc.sqlite")
+    # If you set st.secrets["DB_URL"], the app can auto-download a frequently-updated DB.
+    # Otherwise it falls back to a local path.
+    db_url = st.secrets.get("DB_URL", "")
+    max_age_hours = float(st.secrets.get("DB_MAX_AGE_HOURS", 6))
+
+    default_db = ensure_local_db_with_status(
+        url=db_url,
+        local_path="mlbc.sqlite",
+        max_age_hours=max_age_hours,
+    )
+
+    # Allow forcing a refresh on update days.
+    c_refresh, c_status = st.columns([1, 2])
+    with c_refresh:
+        force_refresh = st.button("Force refresh DB", disabled=(not bool(db_url)))
+    with c_status:
+        st.caption(f"DB cache: {default_db.reason}")
+
+    if force_refresh and db_url:
+        # Clear Streamlit caches so new DB is reflected immediately.
+        try:
+            ensure_local_db(url=db_url, local_path="mlbc.sqlite", max_age_hours=0)
+        finally:
+            st.cache_data.clear()
+            st.cache_resource.clear()
+        st.rerun()
+
+    db_path = st.text_input("SQLite DB path", value=default_db.local_path)
     target_year = st.number_input("Target year", min_value=2000, max_value=9999, value=2141, step=1)
     sims = st.number_input("Simulations", min_value=1000, max_value=200000, value=20000, step=1000)
     seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1)
     k_ab = st.number_input("Regression prior (k-ab)", min_value=0, max_value=1000, value=150, step=10)
+
+    st.divider()
+    st.subheader("Free Agent / destination park")
+    compare_mode = st.checkbox("Compare vs destination team park", value=False)
+    destination_team = None
+    if compare_mode:
+        try:
+            teams_df = cached_team_list(db_path)
+            team_opts = teams_df["team"].dropna().tolist()
+        except Exception:
+            team_opts = []
+        destination_team = st.selectbox("Destination team", options=[""] + team_opts, index=0)
     league_years = st.number_input("League mean window (years)", min_value=1, max_value=10, value=3, step=1)
 
 
@@ -36,7 +77,31 @@ def load_player_list(db: str) -> pd.DataFrame:
     return df
 
 
+def load_team_list(db: str) -> pd.DataFrame:
+    conn = sqlite3.connect(db)
+    try:
+        # Prefer aliases table if present; fallback to player_season_batting
+        try:
+            df = pd.read_sql_query(
+                "SELECT DISTINCT team_full AS team FROM team_aliases WHERE team_full IS NOT NULL AND trim(team_full)<>'' ORDER BY team_full",
+                conn,
+            )
+        except Exception:
+            df = pd.DataFrame()
+
+        if df.empty:
+            df = pd.read_sql_query(
+                "SELECT DISTINCT team AS team FROM player_season_batting WHERE team IS NOT NULL AND trim(team)<>'' ORDER BY team",
+                conn,
+            )
+    finally:
+        conn.close()
+    return df
+
+
 @st.cache_data(show_spinner=False)
+def cached_team_list(db: str) -> pd.DataFrame:
+    return load_team_list(db)
 def cached_player_list(db: str) -> pd.DataFrame:
     return load_player_list(db)
 
@@ -75,7 +140,7 @@ if run:
 
     with st.spinner("Running simulations..."):
         conn = connect(db_path)
-        df, lg = project_players(
+        df_base, lg = project_players(
             conn=conn,
             player_ids=selected_ids,
             target_year=int(target_year),
@@ -84,6 +149,38 @@ if run:
             k_ab_prior=int(k_ab),
             league_years=int(league_years),
         )
+
+        if compare_mode and destination_team:
+            df_dest, _ = project_players(
+                conn=conn,
+                player_ids=selected_ids,
+                target_year=int(target_year),
+                sims=int(sims),
+                seed=int(seed),
+                k_ab_prior=int(k_ab),
+                league_years=int(league_years),
+                override_team=str(destination_team),
+            )
+
+            # Merge and compute deltas
+            df = df_base.merge(
+                df_dest[["player_id", "team", "stadium", "park_mult", "OPS_p50", "HR_p50"]].rename(
+                    columns={
+                        "team": "dest_team",
+                        "stadium": "dest_stadium",
+                        "park_mult": "dest_park_mult",
+                        "OPS_p50": "dest_OPS_p50",
+                        "HR_p50": "dest_HR_p50",
+                    }
+                ),
+                on="player_id",
+                how="left",
+            )
+            df["delta_OPS_p50"] = (df["dest_OPS_p50"] - df["OPS_p50"]).round(3)
+            df["delta_HR_p50"] = (df["dest_HR_p50"] - df["HR_p50"]).round(2)
+        else:
+            df = df_base
+
         conn.close()
 
     if df.empty:
