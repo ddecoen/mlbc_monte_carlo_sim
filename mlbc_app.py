@@ -17,11 +17,18 @@ st.caption("OPS + HR distributions using recent-3 seasons, regression to league,
 
 from get_db import ensure_local_db_with_status, ensure_local_db
 
+# Streamlit raises StreamlitSecretNotFoundError when st.secrets is accessed
+# without a configured secrets.toml. Make local runs work without any secrets.
+try:
+    _secrets = st.secrets
+except Exception:
+    _secrets = {}
+
 with st.sidebar:
-    # If you set st.secrets["DB_URL"], the app can auto-download a frequently-updated DB.
+    # If you set secrets DB_URL, the app can auto-download a frequently-updated DB.
     # Otherwise it falls back to a local path.
-    db_url = st.secrets.get("DB_URL", "")
-    max_age_hours = float(st.secrets.get("DB_MAX_AGE_HOURS", 6))
+    db_url = _secrets.get("DB_URL", "")
+    max_age_hours = float(_secrets.get("DB_MAX_AGE_HOURS", 6))
 
     default_db = ensure_local_db_with_status(
         url=db_url,
