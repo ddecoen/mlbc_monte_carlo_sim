@@ -554,68 +554,103 @@ def scrape_team_stadiums(fetcher: Fetcher) -> List[Dict]:
     url = f"{BASE}/stadiums.php"
     html_page = fetcher.get(url)
 
-    # Grab <b>...</b> chunks. On this page:
-    # - Stadium names are <b>Stadium Name</b>
-    # - "Leased through" years are also often <b>2141</b>, <b>2142</b>, etc.
-    bold = re.findall(r"(?is)<b[^>]*>(.*?)</b>", html_page)
-    bold = [html.unescape(re.sub(r"(?is)<[^>]+>", "", s)).strip() for s in bold]
-    bold = [s for s in bold if s]
+    txt = _collapse_text(html_page)
+    m = re.search(r"MLBC STADIUMS(.*?)(View All League News|View All Team News|POTM)", txt, flags=re.I | re.S)
+    block = m.group(1) if m else txt
+    block = re.sub(r"\s+", " ", block).strip()
 
-    # Get a clean text version too for extracting the non-bold fields.
-    text = _collapse_text(html_page)
+    # Remove the column header if present
+    block = re.sub(r"(?i)^stadium\\s+team\\s+since\\s+leased\\s+through\\s+", "", block)
 
-    # We only want the stadium section
-    m = re.search(r"\bMLBC\s+STADIUMS\b(.+?)(?:View All League News|View All Team News|POTM)", text, flags=re.I)
-    if m:
-        text = m.group(1)
-    text = re.sub(r"\s+", " ", text).strip()
+    tokens = block.split(" ")
 
-    # From web_fetch of the page, we know the header sequence is:
-    # Stadium Team Since Leased through
-    # so skip those tokens.
-    text = re.sub(r"(?i)\bstadium\s+team\s+since\s+leased\s+through\b", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    def is_year(tok: str) -> bool:
+        return bool(re.fullmatch(r"\d{4}", tok))
 
-    # Stadium names appear (mostly) in bold list; we’ll walk them in order and,
-    # for each stadium, find "StadiumName TeamName YYYY (YYYY|-)" in the text stream.
     out: List[Dict] = []
 
-    # Only keep bold items that look like stadium names (avoid years).
-    stadium_candidates = [s for s in bold if not re.fullmatch(r"\d{4}", s) and s.lower() not in ("mlbc stadiums", "stadium", "team", "since", "leased through")]
+    # We'll scan for patterns:
+    #   <stadium words...> <team words...> <since_year> <through_year|-> ...
+    #
+    # Since stadium/team are both variable-length, we use the year as anchor:
+    # when we see a year, everything immediately before it (since last "stadium boundary")
+    # is treated as team, and the stadium is whatever was accumulated earlier.
+    #
+    # Practical heuristic for this page:
+    # - Stadium names always appear before their lease line
+    # - Team names come immediately before the year
+    #
+    # We'll maintain a rolling window of "unassigned words" and carve off the last N tokens
+    # as team once we hit the year. N is determined by walking backwards until we hit a token
+    # that looks like the end of a stadium name boundary (we approximate by using a known year anchor).
+    unassigned: List[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
 
-    # Build a regex that anchors on the exact stadium name, then captures team + years.
-    for stadium in stadium_candidates:
-        # Escape stadium for regex
-        st_re = re.escape(stadium)
+        # Sometimes "-" comes through as "-" already; good.
+        # Sometimes it might be "—" etc; normalize.
+        if tok in ("\\-", "–", "—"):
+            tok = "-"
 
-        # Match: "<stadium> <team> <since> <through|- >"
-        # Team names can be 2-5 tokens typically; use a tempered pattern up to the year.
-        pat = re.compile(
-            rf"(?i)\b{st_re}\b\s+(.+?)\s+(\d{{4}})\s+(\d{{4}}|-)\b"
-        )
-        mm = pat.search(text)
-        if not mm:
-            continue
+        if is_year(tok):
+            # tok is since_year; next token should be through_year or "-"
+            since_year = int(tok)
+            through_tok = tokens[i + 1] if i + 1 < len(tokens) else "-"
+            if through_tok in ("\\-", "–", "—"):
+                through_tok = "-"
+            through_year = None if through_tok == "-" else (int(through_tok) if is_year(through_tok) else None)
 
-        team_s = mm.group(1).strip()
-        since = _safe_int(mm.group(2))
-        through_raw = mm.group(3).strip()
-        through = None if through_raw == "-" else _safe_int(through_raw)
-
-        # sanity
-        if not team_s or since is None:
-            continue
-
-        out.append(
-            {
-                "team": team_s,
-                "stadium": stadium,
-                "since_year": since,
-                "through_year": through,
+            # Now we need to split `unassigned` into [stadium words..., team words...].
+            #
+            # We can do this by looking for the LAST stadium name we saw that ends with common suffixes.
+            # But easiest: on this page, the stadium name is the LAST contiguous phrase ending with
+            # Stadium/Park/Field/Dome/Grounds/Bowl/Coliseum/etc that appears before the team.
+            #
+            # We'll scan from the end backwards to find a plausible stadium end token, then split.
+            stadium_end_words = {
+                "Stadium", "Park", "Field", "Dome", "Grounds", "Bowl", "Coliseum",
+                "Ballpark", "Arena", "Center", "Centre"
             }
-        )
 
-    # Deduplicate (some stadiums may appear multiple times in bold from layout)
+            split_idx = None
+            for j in range(len(unassigned) - 1, -1, -1):
+                if unassigned[j] in stadium_end_words:
+                    split_idx = j + 1
+                    break
+
+            if split_idx is None:
+                # fallback: can't find stadium boundary; skip this record
+                unassigned = []
+                i += 2
+                continue
+
+            stadium = " ".join(unassigned[:split_idx]).strip()
+            team = " ".join(unassigned[split_idx:]).strip()
+
+            if stadium and team:
+                out.append(
+                    dict(
+                        team=team,
+                        stadium=stadium,
+                        since_year=since_year,
+                        through_year=through_year,
+                    )
+                )
+
+            # reset for next record
+            unassigned = []
+            i += 2
+            continue
+
+        # Normal token: accumulate
+        unassigned.append(tok)
+        i += 1
+
+    if not out:
+        raise ValueError("Failed to parse any stadium leases from stadiums.php")
+
+    # Deduplicate
     seen = set()
     deduped: List[Dict] = []
     for r in out:
@@ -625,10 +660,8 @@ def scrape_team_stadiums(fetcher: Fetcher) -> List[Dict]:
         seen.add(key)
         deduped.append(r)
 
-    if not deduped:
-        raise ValueError("Failed to parse any stadium leases from stadiums.php")
-
     return deduped
+
 
 
 
