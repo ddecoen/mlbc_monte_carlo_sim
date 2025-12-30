@@ -191,8 +191,14 @@ if run:
         conn.close()
 
     if df.empty:
-        st.warning("No results (players may not have season batting rows).")
-        st.stop()
+    st.warning("No results for the selected player(s).")
+    st.info(
+        "This usually means the player has not been ingested into the database yet (missing rows in `player_season_batting`).\n\n"
+        "Fix: update the DB by running the scraper with either:\n"
+        "- `--ingest-all` (recommended for shared/hosted DB updates), or\n"
+        "- `--players <player_id>` to ingest a specific free agent."
+    )
+    st.stop()
 
     st.subheader("Results table")
     st.dataframe(df, use_container_width=True)
