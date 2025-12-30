@@ -434,7 +434,41 @@ def project_players(
         ).fetchone()
 
         name = prow["name"] if prow and prow["name"] else f"player_{pid}"
-        age = _parse_age_text(prow["birth_or_age_text"]) if prow else None
+        # -----------------------------
+        # Age handling (advance to target_year)
+        # -----------------------------
+        # Prefer season-level age from the most recent season year we have for the player.
+        # Then advance to the requested target_year.
+        age = None
+        last_season_year = None
+        age_last_season = None
+        
+        r_last = conn.execute(
+            """
+            SELECT season_year, age
+            FROM player_season_batting
+            WHERE player_id=?
+            ORDER BY season_year DESC
+            LIMIT 1
+            """,
+            (int(pid),),
+        ).fetchone()
+        
+        if r_last and r_last["season_year"] is not None:
+            last_season_year = int(r_last["season_year"])
+            age_last_season = r_last["age"]
+        
+        if age_last_season is not None:
+            age_base = int(age_last_season)
+        else:
+        
+            age_base = _parse_age_text(prow["birth_or_age_text"]) if prow else None
+        
+        if age_base is not None and last_season_year is not None:
+            age = int(age_base + (int(target_year) - int(last_season_year)))
+        else:
+            age = age_base
+        
         gb_pct = _safe_float(prow["gb_pct"]) if prow else None
 
         recent = player_recent_seasons(conn, int(pid), n=3)
