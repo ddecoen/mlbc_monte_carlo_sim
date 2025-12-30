@@ -131,12 +131,31 @@ except Exception as e:
 q = st.text_input("Search player name (substring)", value="Sung")
 filtered = players_df[players_df["name"].str.contains(q, case=False, na=False)].head(50)
 
+# IMPORTANT: keep selection options stable.
+# If options are tied to the filtered list, Streamlit reruns can clear selections,
+# making it look like "Run projections" does nothing.
+all_player_ids = players_df["player_id"].tolist()
+
+st.caption(f"Search matches (showing up to 50): {len(filtered)}")
+
 selected_ids: List[int] = st.multiselect(
     "Select players (up to 10 recommended)",
-    options=filtered["player_id"].tolist(),
+    options=all_player_ids,
     format_func=lambda pid: f"{pid} - {players_df.loc[players_df['player_id']==pid, 'name'].values[0]}",
-    default=[2030] if 2030 in filtered["player_id"].tolist() else [],
+    default=[2030] if 2030 in all_player_ids else [],
 )
+
+# Convenience quick-pick from current filtered results
+quick_pick = st.selectbox(
+    "Quick pick from search results",
+    options=[""] + filtered["player_id"].tolist(),
+    index=0,
+    format_func=lambda pid: "" if pid == "" else f"{pid} - {players_df.loc[players_df['player_id']==pid, 'name'].values[0]}",
+)
+if quick_pick:
+    pid = int(quick_pick)
+    if pid not in selected_ids:
+        selected_ids = selected_ids + [pid]
 
 run = st.button("Run projections")
 
@@ -191,7 +210,14 @@ if run:
         conn.close()
 
     if df.empty:
-        st.warning("No results (players may not have season batting rows).")
+        st.warning("No results for the selected player(s).")
+        st.info(
+            "This usually means the player has not been ingested into the database yet (missing rows in `player_season_batting`).\n\n"
+            "Fix: update the DB by running the scraper with either:\n"
+            "- `--ingest-all` (recommended for shared/hosted DB updates), or\n"
+            "- `--players <player_id>` to ingest a specific free agent.\n\n"
+            "For commissioners: for hosted DB updates, run `--discover-players` then `--ingest-all`."
+        )
         st.stop()
 
     st.subheader("Results table")
