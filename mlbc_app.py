@@ -65,10 +65,18 @@ with st.sidebar:
     if compare_mode:
         try:
             teams_df = cached_team_list(db_path)
-            team_opts = teams_df["team"].dropna().tolist()
+            team_opts = teams_df["abbrev"].dropna().tolist()
+            _label_map = dict(zip(teams_df["abbrev"], teams_df["label"]))
         except Exception:
             team_opts = []
-        destination_team = st.selectbox("Destination team", options=[""] + team_opts, index=0)
+            _label_map = {}
+
+        destination_team = st.selectbox(
+            "Destination team",
+            options=[""] + team_opts,
+            index=0,
+            format_func=lambda t: "" if t == "" else _label_map.get(t, t),
+        )
     league_years = st.number_input("League mean window (years)", min_value=1, max_value=10, value=3, step=1)
 
 
@@ -87,23 +95,38 @@ def load_player_list(db: str) -> pd.DataFrame:
 def load_team_list(db: str) -> pd.DataFrame:
     conn = sqlite3.connect(db)
     try:
-        # Prefer aliases table if present; fallback to player_season_batting
-        try:
-            df = pd.read_sql_query(
-                "SELECT DISTINCT team_full AS team FROM team_aliases WHERE team_full IS NOT NULL AND trim(team_full)<>'' ORDER BY team_full",
-                conn,
-            )
-        except Exception:
-            df = pd.DataFrame()
+        # Always start from teams that actually appear in the batting table.
+        teams = pd.read_sql_query(
+            """
+            SELECT DISTINCT team AS abbrev
+            FROM player_season_batting
+            WHERE team IS NOT NULL AND trim(team) <> ''
+            ORDER BY team
+            """,
+            conn,
+        )
 
-        if df.empty:
-            df = pd.read_sql_query(
-                "SELECT DISTINCT team AS team FROM player_season_batting WHERE team IS NOT NULL AND trim(team)<>'' ORDER BY team",
+        # Optional: map abbrev -> team_full if team_aliases exists.
+        try:
+            aliases = pd.read_sql_query(
+                "SELECT abbrev, team_full FROM team_aliases",
                 conn,
             )
+            teams = teams.merge(aliases, on="abbrev", how="left")
+        except Exception:
+            teams["team_full"] = None
+
+        def _label(row) -> str:
+            ab = str(row["abbrev"])
+            tf = row.get("team_full", None)
+            if tf is not None and str(tf).strip():
+                return f"{ab} — {str(tf).strip()}"
+            return ab
+
+        teams["label"] = teams.apply(_label, axis=1)
+        return teams
     finally:
         conn.close()
-    return df
 
 
 @st.cache_data(show_spinner=False)
