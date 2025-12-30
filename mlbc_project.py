@@ -417,14 +417,6 @@ def project_players(
         players = player_ids
     assert players is not None
 
-
-    # New optional overrides for "FA signing" scenarios.
-    # If set, projections use the destination team/stadium's park factor instead
-    # of inferring the player's most recent team.
-    override_team: Optional[str] = legacy_kwargs.pop("override_team", None)
-    override_stadium: Optional[str] = legacy_kwargs.pop("override_stadium", None)
-    home_game_share: float = float(legacy_kwargs.pop("home_game_share", 0.5) or 0.5)
-    home_game_share = float(np.clip(home_game_share, 0.0, 1.0))
     sims_v, k_ab_v, lg_years_v, seed_v, hr_disp_v = _normalize_kwargs(
         sims=sims, k_ab=k_ab, lg_years=lg_years, seed=seed, hr_dispersion=hr_dispersion, legacy_kwargs=legacy_kwargs
     )
@@ -442,46 +434,7 @@ def project_players(
         ).fetchone()
 
         name = prow["name"] if prow and prow["name"] else f"player_{pid}"
-        # -----------------------------
-    # Age handling
-    # -----------------------------
-    # Prefer season-level age from the most recent season we have, then advance it by
-    # (target_year - last_season_year). If season ages are missing, fall back to parsing
-    # players.birth_or_age_text (and still advance from last_season_year if possible).
-    age = None
-    last_season_year = None
-
-    # last season year (we use this even if age column is missing)
-    r_last = conn.execute(
-            """
-            SELECT season_year, age
-            FROM player_season_batting
-            WHERE player_id=?
-            ORDER BY season_year DESC
-            LIMIT 1
-            """,
-            (int(pid),),
-    ).fetchone()
-
-    if r_last and r_last["season_year"] is not None:
-            last_season_year = int(r_last["season_year"])
-            age_last = r_last["age"]
-    else:
-            age_last = None
-
-    # base age: season age if present, else parse header age
-    if age_last is not None:
-            age_base = int(age_last)
-    else:
-            age_base = _parse_age_text(prow["birth_or_age_text"]) if prow else
-    None
-
-    if age_base is not None and last_season_year is not None:
-            age = int(age_base + (int(target_year) - int(last_season_year)))
-    else:
-            age = age_base
-    
-    age = _parse_age_text(prow["birth_or_age_text"]) if prow else None
+        age = _parse_age_text(prow["birth_or_age_text"]) if prow else None
         gb_pct = _safe_float(prow["gb_pct"]) if prow else None
 
         recent = player_recent_seasons(conn, int(pid), n=3)
@@ -530,14 +483,11 @@ def project_players(
             team_raw = (r["team"] if r else None)
 
         team_full = resolve_team_full(conn, str(team_raw) if team_raw is not None else None)
-
-        # Destination overrides (FA signing scenario)
-        team_for_park = override_team or (team_full or team_raw)
-        stadium = override_stadium or resolve_stadium_for_team_year(conn, team_for_park, int(target_year))
+        stadium = resolve_stadium_for_team_year(conn, team_full or team_raw, int(target_year))
 
         pf_year = int(target_year) - 1
-        pf_year_used, home_idx, away_idx = get_park_pf_ops_for_team_year(conn, team_for_park, pf_year)
-        pmult = float((home_idx / 100.0) * home_game_share + (away_idx / 100.0) * (1.0 - home_game_share))
+        pf_year_used, home_idx, away_idx = get_park_pf_ops_for_team_year(conn, team_full or team_raw, pf_year)
+        pmult = park_multiplier(home_idx, away_idx)
 
         ops_tt_prepark = estimate_true_talent_ops(
             ops_recent=float(ops_recent3),
