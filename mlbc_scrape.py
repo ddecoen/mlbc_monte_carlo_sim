@@ -134,6 +134,7 @@ class Fetcher:
 # ----------------------------
 PLAYER_ID_RE = re.compile(r"pcard\.php\?id=(\d+)", re.I)
 PCARD_SPLIT_ID_RE = re.compile(r"pcardsplit\.php\?id=(\d+)", re.I)
+ROSTER_ID_RE = re.compile(r"pcard\.php\?id=(\d+)", re.I)
 
 
 def _read_html_tables(page_html: str) -> List[pd.DataFrame]:
