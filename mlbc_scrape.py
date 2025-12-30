@@ -613,20 +613,30 @@ def scrape_team_stadiums(fetcher: Fetcher) -> List[Dict]:
                 "Ballpark", "Arena", "Center", "Centre"
             }
 
-            split_idx = None
+            # Find the LAST stadium-ending token (end of the actual stadium we want)
+            end_j = None
             for j in range(len(unassigned) - 1, -1, -1):
                 if unassigned[j] in stadium_end_words:
-                    split_idx = j + 1
+                    end_j = j
                     break
-
-            if split_idx is None:
-                # fallback: can't find stadium boundary; skip this record
+            
+            if end_j is None:
                 unassigned = []
                 i += 2
                 continue
+            
+            # Find the previous stadium-ending token before end_j; the stadium starts right after it.
+            prev_end_j = None
+            for j in range(end_j - 1, -1, -1):
+                if unassigned[j] in stadium_end_words:
+                    prev_end_j = j
+                    break
+            
+            start_idx = (prev_end_j + 1) if prev_end_j is not None else 0
+            
+            stadium = " ".join(unassigned[start_idx : end_j + 1]).strip()
+            team = " ".join(unassigned[end_j + 1 :]).strip()
 
-            stadium = " ".join(unassigned[:split_idx]).strip()
-            team = " ".join(unassigned[split_idx:]).strip()
 
             if stadium and team:
                 out.append(
