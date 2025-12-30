@@ -255,34 +255,67 @@ def estimate_hr_rate(df_recent: pd.DataFrame, lg_hr_per_ab: float, k_ab: float, 
 # Park factors
 # -----------------------------
 def get_park_pf_ops_for_team_year(conn: sqlite3.Connection, team_any: Optional[str], season_year: int) -> Tuple[Optional[int], float, float]:
+    """Return (pf_year_used, home_idx, away_idx) from park_factors_team_year.
+
+    This repo's current DB schema stores:
+      park_factors_team_year(team, season_year, home_idx, away_idx, ...)
+
+    Fallbacks:
+      - If exact (team, season_year) missing, use latest available season_year for that team.
+      - If table/cols missing, return 100/100.
+    """
     if not team_any:
         return None, 100.0, 100.0
-    try:
-        r = conn.execute(
+
+    # Ensure table/cols exist
+    cols = _table_columns(conn, "park_factors_team_year")
+    if not cols or "home_idx" not in cols or "away_idx" not in cols:
+        return None, 100.0, 100.0
+
+    def _q(where_team: str, year: Optional[int]) -> Optional[sqlite3.Row]:
+        if year is None:
+            return conn.execute(
+                """
+                SELECT season_year, home_idx, away_idx
+                FROM park_factors_team_year
+                WHERE team = ?
+                ORDER BY season_year DESC
+                LIMIT 1
+                """,
+                (where_team,),
+            ).fetchone()
+        return conn.execute(
             """
-            SELECT season_year, pf_ops_index
+            SELECT season_year, home_idx, away_idx
             FROM park_factors_team_year
             WHERE team = ? AND season_year = ?
             LIMIT 1
             """,
-            (team_any, season_year),
+            (where_team, int(year)),
         ).fetchone()
+
+    try:
+        r = _q(str(team_any), int(season_year))
+        if not r:
+            r = conn.execute(
+                """
+                SELECT season_year, home_idx, away_idx
+                FROM park_factors_team_year
+                WHERE team = ? COLLATE NOCASE AND season_year = ?
+                LIMIT 1
+                """,
+                (str(team_any), int(season_year)),
+            ).fetchone()
+
+        if r and r["home_idx"] is not None and r["away_idx"] is not None:
+            return int(r["season_year"]), float(r["home_idx"]), float(r["away_idx"])
+
+        # fallback to latest for this team
+        r = _q(str(team_any), None)
+        if r and r["home_idx"] is not None and r["away_idx"] is not None:
+            return int(r["season_year"]), float(r["home_idx"]), float(r["away_idx"])
     except sqlite3.OperationalError:
         return None, 100.0, 100.0
-
-    if not r:
-        r = conn.execute(
-            """
-            SELECT season_year, pf_ops_index
-            FROM park_factors_team_year
-            WHERE team = ? COLLATE NOCASE AND season_year = ?
-            LIMIT 1
-            """,
-            (team_any, season_year),
-        ).fetchone()
-
-    if r and r["pf_ops_index"] is not None:
-        return int(r["season_year"]), float(r["pf_ops_index"]), 100.0
 
     return None, 100.0, 100.0
 
