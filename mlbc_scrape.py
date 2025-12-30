@@ -553,43 +553,70 @@ def scrape_player_splits(fetcher: Fetcher, player_id: int) -> List[Dict]:
 def scrape_team_stadiums(fetcher: Fetcher) -> List[Dict]:
     url = f"{BASE}/stadiums.php"
     html_page = fetcher.get(url)
-    dfs = _read_html_tables(html_page)
-    if not dfs:
-        raise ValueError("No parseable tables on stadiums.php")
 
-    df = None
-    for t in dfs:
-        if t.shape[1] >= 3:
-            df = t
-            break
-    if df is None:
-        df = dfs[0]
+    # Convert HTML -> plain text (collapses tags, removes script/style)
+    text = _collapse_text(html_page)
 
-    df.columns = [f"c{i}" for i in range(df.shape[1])]
+    # We only want the portion after the "MLBC STADIUMS" header if present
+    # (keeps regex from matching random footer numbers).
+    m = re.search(r"\bMLBC\s+STADIUMS\b(.+)$", text, flags=re.I)
+    if m:
+        text = m.group(1)
+
+    # Example patterns in the collapsed page text:
+    #   "Kauffman Stadium San Francisco Seals 2140 2142"
+    #   "Louisville Bats 2108 -"
+    #
+    # We'll extract as: stadium, team, since_year, through_year/-
+    # Stadium + team are greedy-but-bounded by the year tokens.
+    lease_re = re.compile(
+        r"""
+        (?P<stadium>.+?)\s+
+        (?P<team>.+?)\s+
+        (?P<since>\d{4})\s+
+        (?P<through>\d{4}|-)
+        (?=\s|$)
+        """,
+        flags=re.VERBOSE,
+    )
+
+    # The page is essentially a long list; to avoid runaway matches,
+    # split into chunks around known year tokens.
+    # A simple way: replace multiple spaces, then scan with regex globally.
+    text = re.sub(r"\s+", " ", text).strip()
 
     out: List[Dict] = []
-    for _, r in df.iterrows():
-        team = r.get("c0")
-        stadium = r.get("c1")
-        since = r.get("c2")
-        through = r.get("c3") if "c3" in df.columns else None
+    for mm in lease_re.finditer(text):
+        stadium_s = mm.group("stadium").strip()
+        team_s = mm.group("team").strip()
+        since = _safe_int(mm.group("since"))
+        through_raw = mm.group("through").strip()
+        through = None if through_raw == "-" else _safe_int(through_raw)
 
-        if team is None or stadium is None:
+        # Light cleanup: strip any leftover header fragments
+        if stadium_s.lower().startswith("stadium team"):
             continue
-        team_s = str(team).strip()
-        stadium_s = str(stadium).strip()
-        if team_s == "" or stadium_s == "":
+        if team_s.lower() in ("team", "stadiums"):
+            continue
+
+        # Sanity: avoid absurdly long captures if something goes wrong
+        if len(stadium_s) > 80 or len(team_s) > 80:
             continue
 
         out.append(
             {
                 "team": team_s,
                 "stadium": stadium_s,
-                "since_year": _safe_int(since),
-                "through_year": _safe_int(through),
+                "since_year": since,
+                "through_year": through,
             }
         )
+
+    if not out:
+        raise ValueError("Failed to parse any stadium leases from stadiums.php")
+
     return out
+
 
 
 def rebuild_team_aliases_from_stadiums(conn: sqlite3.Connection) -> None:
