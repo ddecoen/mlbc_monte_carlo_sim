@@ -609,6 +609,74 @@ def rebuild_team_aliases_from_stadiums(conn: sqlite3.Connection) -> None:
 # ----------------------------
 # Discover players
 # ----------------------------
+
+
+def _extract_player_ids_from_roster_html(page_html: str) -> List[int]:
+    ids = [int(m.group(1)) for m in ROSTER_ID_RE.finditer(page_html or "")]
+    # de-dupe preserving order
+    out: List[int] = []
+    seen: set[int] = set()
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def discover_roster_players(
+    conn: sqlite3.Connection,
+    fetcher: Fetcher,
+    *,
+    teams: Sequence[str],
+    verbose: bool = True,
+) -> int:
+    """Discover player IDs by scraping each team's ML roster page.
+
+    Defaults should be a list of team abbrevs (e.g. SF, LOUI) from the batting table.
+    """
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
+
+    discovered = 0
+    seen: set[int] = set(r[0] for r in conn.execute("SELECT player_id FROM player_ids").fetchall())
+
+    for t in teams:
+        team = str(t).strip()
+        if not team:
+            continue
+
+        url = f"{BASE}/teamrosters_team.php?team={urllib.parse.quote(team)}"
+        try:
+            page = fetcher.get(url)
+        except Exception as e:
+            log(f"[rosters] fetch failed team={team}: {e}")
+            continue
+
+        ids = _extract_player_ids_from_roster_html(page)
+        if not ids:
+            log(f"[rosters] team={team} ids=0")
+            continue
+
+        new_ids = [i for i in ids if i not in seen]
+        if new_ids:
+            conn.executemany("INSERT OR IGNORE INTO player_ids(player_id) VALUES(?)", [(i,) for i in new_ids])
+            discovered += len(new_ids)
+            for i in new_ids:
+                seen.add(i)
+
+        # Store roster membership for debugging/coverage.
+        now = int(time.time())
+        conn.executemany(
+            "INSERT OR REPLACE INTO team_roster_players(team, player_id, scraped_ts) VALUES(?,?,?)",
+            [(team, i, now) for i in ids],
+        )
+        conn.commit()
+
+        log(f"[rosters] team={team} ids={len(ids)} new={len(new_ids)}")
+
+    return discovered
 def discover_players(
     conn: sqlite3.Connection,
     fetcher: Fetcher,
