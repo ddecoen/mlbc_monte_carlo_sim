@@ -83,6 +83,13 @@ CREATE TABLE IF NOT EXISTS team_stadiums (
   PRIMARY KEY(team, stadium, since_year, through_year)
 );
 
+
+CREATE TABLE IF NOT EXISTS team_roster_players (
+  team TEXT NOT NULL,
+  player_id INTEGER NOT NULL,
+  scraped_ts INTEGER,
+  PRIMARY KEY(team, player_id)
+);
 CREATE TABLE IF NOT EXISTS team_aliases (
   abbrev TEXT PRIMARY KEY,
   team_full TEXT NOT NULL
@@ -148,6 +155,10 @@ def _collapse_text(page_html: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
+    # Existing discovery scrapes leaderboard pages.
+    # For team roster pages, we also need to parse JavaScript links like:
+    #   javascript:pcards('pcard.php?id=2030%27,%27pcard2030%27,495,705)
 
 def _extract_player_ids_from_html(page_html: str) -> List[int]:
     ids = set(int(m.group(1)) for m in PLAYER_ID_RE.finditer(page_html))
@@ -862,6 +873,8 @@ def main() -> None:
 
     ap.add_argument("--discover-players", action="store_true")
     ap.add_argument("--discover-max-pages", type=int, default=50)
+    ap.add_argument("--discover-rosters", action="store_true", help="Discover player IDs from each team's ML roster page")
+    ap.add_argument("--roster-teams", nargs="*", default=None, help="Optional subset of team abbrevs for roster discovery")
     ap.add_argument("--discover-seeds", nargs="*", default=None)
 
     ap.add_argument("--ingest-all", action="store_true")
@@ -873,6 +886,16 @@ def main() -> None:
     conn = db_connect(args.db)
     fetcher = Fetcher(timeout=args.timeout, sleep=args.sleep)
 
+
+    if args.discover_rosters:
+        if args.roster_teams:
+            teams = [t.strip() for t in args.roster_teams if t and t.strip()]
+        else:
+            teams = [r[0] for r in conn.execute(
+                "SELECT DISTINCT team FROM player_season_batting WHERE team IS NOT NULL AND trim(team)<>'' ORDER BY team"
+            ).fetchall()]
+        n = discover_roster_players(conn, fetcher, teams=teams, verbose=True)
+        print(f"Discovered {n} new roster player IDs", flush=True)
     if args.discover_players:
         seeds = args.discover_seeds if args.discover_seeds else default_discover_seeds()
         n = discover_players(conn, fetcher, seeds=seeds, max_pages=args.discover_max_pages, verbose=True)
