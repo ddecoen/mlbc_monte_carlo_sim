@@ -554,68 +554,82 @@ def scrape_team_stadiums(fetcher: Fetcher) -> List[Dict]:
     url = f"{BASE}/stadiums.php"
     html_page = fetcher.get(url)
 
-    # Convert HTML -> plain text (collapses tags, removes script/style)
+    # Grab <b>...</b> chunks. On this page:
+    # - Stadium names are <b>Stadium Name</b>
+    # - "Leased through" years are also often <b>2141</b>, <b>2142</b>, etc.
+    bold = re.findall(r"(?is)<b[^>]*>(.*?)</b>", html_page)
+    bold = [html.unescape(re.sub(r"(?is)<[^>]+>", "", s)).strip() for s in bold]
+    bold = [s for s in bold if s]
+
+    # Get a clean text version too for extracting the non-bold fields.
     text = _collapse_text(html_page)
 
-    # We only want the portion after the "MLBC STADIUMS" header if present
-    # (keeps regex from matching random footer numbers).
-    m = re.search(r"\bMLBC\s+STADIUMS\b(.+)$", text, flags=re.I)
+    # We only want the stadium section
+    m = re.search(r"\bMLBC\s+STADIUMS\b(.+?)(?:View All League News|View All Team News|POTM)", text, flags=re.I)
     if m:
         text = m.group(1)
-
-    # Example patterns in the collapsed page text:
-    #   "Kauffman Stadium San Francisco Seals 2140 2142"
-    #   "Louisville Bats 2108 -"
-    #
-    # We'll extract as: stadium, team, since_year, through_year/-
-    # Stadium + team are greedy-but-bounded by the year tokens.
-    lease_re = re.compile(
-        r"""
-        (?P<stadium>.+?)\s+
-        (?P<team>.+?)\s+
-        (?P<since>\d{4})\s+
-        (?P<through>\d{4}|-)
-        (?=\s|$)
-        """,
-        flags=re.VERBOSE,
-    )
-
-    # The page is essentially a long list; to avoid runaway matches,
-    # split into chunks around known year tokens.
-    # A simple way: replace multiple spaces, then scan with regex globally.
     text = re.sub(r"\s+", " ", text).strip()
 
+    # From web_fetch of the page, we know the header sequence is:
+    # Stadium Team Since Leased through
+    # so skip those tokens.
+    text = re.sub(r"(?i)\bstadium\s+team\s+since\s+leased\s+through\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Stadium names appear (mostly) in bold list; we’ll walk them in order and,
+    # for each stadium, find "StadiumName TeamName YYYY (YYYY|-)" in the text stream.
     out: List[Dict] = []
-    for mm in lease_re.finditer(text):
-        stadium_s = mm.group("stadium").strip()
-        team_s = mm.group("team").strip()
-        since = _safe_int(mm.group("since"))
-        through_raw = mm.group("through").strip()
+
+    # Only keep bold items that look like stadium names (avoid years).
+    stadium_candidates = [s for s in bold if not re.fullmatch(r"\d{4}", s) and s.lower() not in ("mlbc stadiums", "stadium", "team", "since", "leased through")]
+
+    # Build a regex that anchors on the exact stadium name, then captures team + years.
+    for stadium in stadium_candidates:
+        # Escape stadium for regex
+        st_re = re.escape(stadium)
+
+        # Match: "<stadium> <team> <since> <through|- >"
+        # Team names can be 2-5 tokens typically; use a tempered pattern up to the year.
+        pat = re.compile(
+            rf"(?i)\b{st_re}\b\s+(.+?)\s+(\d{{4}})\s+(\d{{4}}|-)\b"
+        )
+        mm = pat.search(text)
+        if not mm:
+            continue
+
+        team_s = mm.group(1).strip()
+        since = _safe_int(mm.group(2))
+        through_raw = mm.group(3).strip()
         through = None if through_raw == "-" else _safe_int(through_raw)
 
-        # Light cleanup: strip any leftover header fragments
-        if stadium_s.lower().startswith("stadium team"):
-            continue
-        if team_s.lower() in ("team", "stadiums"):
-            continue
-
-        # Sanity: avoid absurdly long captures if something goes wrong
-        if len(stadium_s) > 80 or len(team_s) > 80:
+        # sanity
+        if not team_s or since is None:
             continue
 
         out.append(
             {
                 "team": team_s,
-                "stadium": stadium_s,
+                "stadium": stadium,
                 "since_year": since,
                 "through_year": through,
             }
         )
 
-    if not out:
+    # Deduplicate (some stadiums may appear multiple times in bold from layout)
+    seen = set()
+    deduped: List[Dict] = []
+    for r in out:
+        key = (r["team"], r["stadium"], r["since_year"], r["through_year"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    if not deduped:
         raise ValueError("Failed to parse any stadium leases from stadiums.php")
 
-    return out
+    return deduped
+
 
 
 
