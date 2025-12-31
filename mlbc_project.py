@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 mlbc_project.py
@@ -13,6 +14,15 @@ CLI:
 """
 
 from __future__ import annotations
+
+def forward_years(target_year: int, last_season_year: int) -> int:
+    """Number of seasons projected forward from the last observed season."""
+    try:
+        return max(0, int(target_year) - int(last_season_year))
+    except Exception:
+        return 0
+
+
 
 import argparse
 import math
@@ -223,6 +233,45 @@ def weighted_recent_ops(df_recent: pd.DataFrame) -> Tuple[Optional[float], Optio
     ops = df["ops"].astype(float).to_numpy()
     return float(np.average(ops, weights=w)), float(w.sum())
 
+def weighted_recent_hr_per_ab(df_recent: pd.DataFrame) -> tuple[float | None, float | None]:
+    """Recency-weighted HR/AB from last up to 3 seasons.
+
+    Correct units:
+      - each season contributes a rate (HR/AB)
+      - we weight by recency only (not AB), and separately return total AB
+        for regression strength.
+    """
+    if df_recent is None or df_recent.empty:
+        return None, None
+
+    df = df_recent.copy()
+    df = df[df["ab"].fillna(0) > 0]
+    if df.empty:
+        return None, None
+
+    # Most recent first
+    df = df.sort_values("season_year", ascending=False).reset_index(drop=True)
+
+    rec_w = [0.60, 0.30, 0.10]
+    rates = []
+    weights = []
+    total_ab = 0.0
+
+    for i in range(min(3, len(df))):
+        ab = float(df.loc[i, "ab"])
+        hr = float(df.loc[i, "hr"])
+        if ab <= 0:
+            continue
+        rates.append(hr / ab)
+        weights.append(rec_w[i])
+        total_ab += ab
+
+    if not weights:
+        return None, None
+
+    wsum = sum(weights)
+    hr_rate = sum(r * w for r, w in zip(rates, weights)) / wsum
+    return float(hr_rate), float(total_ab)
 
 def estimate_true_talent_ops(ops_recent: float, ab_recent: float, lg_ops: float, k_ab: float) -> float:
     ab_recent = max(0.0, float(ab_recent))
@@ -567,12 +616,35 @@ def project_players(
         ab_last = float(recent.iloc[0]["ab"]) if not recent.empty else float(ab_recent / 3.0)
         ab_proj = int(np.clip(ab_last, 250, 700))
 
-        hr_rate_adj = estimate_hr_rate(recent, lg_hr_per_ab=float(lg.hr_per_ab), k_ab=float(k_ab_v), gb_pct=gb_pct)
+        hr_rate_recent, ab_hr_recent = weighted_recent_hr_per_ab(recent)
+        if hr_rate_recent is None or ab_hr_recent is None:
+            hr_rate_adj = float(lg.hr_per_ab)
+        else:
+            # Regress HR/AB toward league with an AB prior
+            k_ab_hr = float(k_ab_v)
+            hr_rate_adj = float((hr_rate_recent * ab_hr_recent + float(lg.hr_per_ab) * k_ab_hr) / (ab_hr_recent + k_ab_hr))
+
+        # GB% effect (kept modest)
+        hr_rate_adj *= (gb_effect_multiplier(gb_pct) ** 0.6)
+
+        # Drift HR rate toward league the farther we project out (stabilizes long-range forecasts)
+        if last_season_year is not None:
+            fwd = forward_years(int(target_year), int(last_season_year))
+            # 6% of the gap closes per forward year (tunable)
+            shrink = min(0.40, 0.06 * fwd)
+            hr_rate_adj = float((1.0 - shrink) * hr_rate_adj + shrink * float(lg.hr_per_ab))
+
         if hr_rate_adj is None:
             hr_rate_adj = float(lg.hr_per_ab)
 
         sample_ab = float(ab_recent)
         ops_sigma = float(np.clip(0.10 - 0.04 * (sample_ab / (sample_ab + 400.0)), 0.05, 0.11))
+
+        # Wider HR uncertainty the farther out we project
+        hr_disp_eff = float(hr_disp_v)
+        if last_season_year is not None:
+            fwd = forward_years(int(target_year), int(last_season_year))
+            hr_disp_eff = float(max(40.0, hr_disp_eff / (1.0 + 0.35 * fwd)))
 
         ops_sim, hr_sim = simulate_ops_hr(
             rng=rng,
@@ -581,7 +653,7 @@ def project_players(
             ops_mu_prepark=float(ops_tt_prepark),
             park_mult=float(pmult),
             hr_rate_adj=float(hr_rate_adj),
-            hr_dispersion=float(hr_disp_v),
+            hr_dispersion=float(hr_disp_eff),
             ops_sigma=float(ops_sigma),
         )
 
