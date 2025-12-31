@@ -60,23 +60,47 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Free Agent / destination park")
-    compare_mode = st.checkbox("Compare vs destination team park", value=False)
-    destination_team = None
-    if compare_mode:
-        try:
-            teams_df = cached_team_list(db_path)
-            team_opts = teams_df["abbrev"].dropna().tolist()
-            _label_map = dict(zip(teams_df["abbrev"], teams_df["label"]))
-        except Exception:
-            team_opts = []
-            _label_map = {}
+    compare_mode = st.checkbox("Compare vs destination park", value=False)
 
-        destination_team = st.selectbox(
-            "Destination team",
-            options=[""] + team_opts,
-            index=0,
-            format_func=lambda t: "" if t == "" else _label_map.get(t, t),
+    destination_mode = "Team"
+    destination_team = None
+    destination_stadium = None
+
+    if compare_mode:
+        destination_mode = st.radio(
+            "Destination selection",
+            options=["Team", "Stadium"],
+            horizontal=True,
+            help="Team uses that team's park factors. Stadium is useful for relocations; we resolve the tenant team (if any) for PF proxy.",
         )
+
+        if destination_mode == "Team":
+            try:
+                teams_df = cached_team_list(db_path)
+                team_opts = teams_df["abbrev"].dropna().tolist()
+                _label_map = dict(zip(teams_df["abbrev"], teams_df["label"]))
+            except Exception:
+                team_opts = []
+                _label_map = {}
+
+            destination_team = st.selectbox(
+                "Destination team",
+                options=[""] + team_opts,
+                index=0,
+                format_func=lambda t: "" if t == "" else _label_map.get(t, t),
+            )
+        else:
+            try:
+                stadiums_df = cached_stadium_list(db_path)
+                stadium_opts = stadiums_df["stadium"].dropna().tolist()
+            except Exception:
+                stadium_opts = []
+
+            destination_stadium = st.selectbox(
+                "Destination stadium",
+                options=[""] + stadium_opts,
+                index=0,
+            )
     league_years = st.number_input("League mean window (years)", min_value=1, max_value=10, value=3, step=1)
 
 
@@ -127,6 +151,27 @@ def load_team_list(db: str) -> pd.DataFrame:
         return teams
     finally:
         conn.close()
+
+
+def load_stadium_list(db: str) -> pd.DataFrame:
+    conn = sqlite3.connect(db)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT DISTINCT stadium
+            FROM team_stadiums
+            WHERE stadium IS NOT NULL AND trim(stadium) <> ''
+            ORDER BY stadium
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+    return df
+
+@st.cache_data(show_spinner=False)
+def cached_stadium_list(db: str) -> pd.DataFrame:
+    return load_stadium_list(db)
 
 
 @st.cache_data(show_spinner=False)
@@ -199,7 +244,42 @@ if run:
             league_years=int(league_years),
         )
 
-        if compare_mode and destination_team:
+        if compare_mode and (destination_team or destination_stadium):
+            # Stadium-mode: resolve tenant team for the chosen stadium in target_year and
+            # use that team's PF indices as a proxy. Also override displayed stadium.
+            override_team = None
+            override_stadium = None
+
+            if destination_mode == "Team" and destination_team:
+                override_team = str(destination_team)
+
+            elif destination_mode == "Stadium" and destination_stadium:
+                override_stadium = str(destination_stadium)
+
+                # Find tenant team (full name) for that stadium/year
+                try:
+                    r = conn.execute(
+                        """
+                        SELECT team
+                        FROM team_stadiums
+                        WHERE stadium = ?
+                          AND (? BETWEEN COALESCE(since_year, 0) AND COALESCE(through_year, 9999))
+                        LIMIT 1
+                        """,
+                        (override_stadium, int(target_year)),
+                    ).fetchone()
+
+                    if r and r["team"]:
+                        # team_stadiums.team is usually full name; map to abbrev if possible
+                        rr = conn.execute(
+                            "SELECT abbrev FROM team_aliases WHERE team_full=? COLLATE NOCASE LIMIT 1",
+                            (str(r["team"]),),
+                        ).fetchone()
+                        if rr and rr["abbrev"]:
+                            override_team = str(rr["abbrev"])
+                except Exception:
+                    pass
+
             df_dest, _ = project_players(
                 conn=conn,
                 player_ids=selected_ids,
@@ -208,7 +288,8 @@ if run:
                 seed=int(seed),
                 k_ab_prior=int(k_ab),
                 league_years=int(league_years),
-                override_team=str(destination_team),
+                override_team=override_team,
+                override_stadium=override_stadium,
             )
 
             # Merge and compute deltas
