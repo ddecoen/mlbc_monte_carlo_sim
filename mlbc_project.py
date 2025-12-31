@@ -316,6 +316,21 @@ def get_park_pf_ops_for_team_year(conn: sqlite3.Connection, team_any: Optional[s
     if not team_any:
         return None, 100.0, 100.0
 
+    # If we were passed a full team name but PFs are keyed by abbrev, try reverse alias lookup.
+    team_keys = [str(team_any)]
+    try:
+        cols_alias = _table_columns(conn, "team_aliases")
+        if cols_alias and "abbrev" in cols_alias and "team_full" in cols_alias:
+            r = conn.execute(
+                "SELECT abbrev FROM team_aliases WHERE team_full=? COLLATE NOCASE LIMIT 1",
+                (str(team_any),),
+            ).fetchone()
+            if r and r["abbrev"]:
+                team_keys.insert(0, str(r["abbrev"]))  # prefer abbrev first
+    except Exception:
+        pass
+
+
     # Ensure table/cols exist
     cols = _table_columns(conn, "park_factors_team_year")
     if not cols or "home_idx" not in cols or "away_idx" not in cols:
