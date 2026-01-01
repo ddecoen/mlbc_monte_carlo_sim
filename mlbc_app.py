@@ -7,7 +7,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 # Import the engine from mlbc_project.py
-from mlbc_project import connect, project_players
+from mlbc_project import connect, project_players, project_pitchers
 
 
 st.set_page_config(page_title="MLBC Projections", layout="wide")
@@ -56,27 +56,66 @@ with st.sidebar:
     target_year = st.number_input("Target year", min_value=2000, max_value=9999, value=2141, step=1)
     sims = st.number_input("Simulations", min_value=1000, max_value=200000, value=20000, step=1000)
     seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1)
+
+    st.divider()
+    st.subheader("Mode")
+    mode = st.radio("Projection type", options=["Hitters", "Pitchers"], horizontal=True)
+
+    # Pitcher-only knobs
+    if mode == "Pitchers":
+        k_ip = st.number_input("Regression prior (k-ip)", min_value=0.0, max_value=1000.0, value=100.0, step=10.0)
+    else:
+        k_ip = None
     k_ab = st.number_input("Regression prior (k-ab)", min_value=0, max_value=1000, value=150, step=10)
 
     st.divider()
     st.subheader("Free Agent / destination park")
-    compare_mode = st.checkbox("Compare vs destination team park", value=False)
-    destination_team = None
-    if compare_mode:
-        try:
-            teams_df = cached_team_list(db_path)
-            team_opts = teams_df["abbrev"].dropna().tolist()
-            _label_map = dict(zip(teams_df["abbrev"], teams_df["label"]))
-        except Exception:
-            team_opts = []
-            _label_map = {}
+    compare_mode = st.checkbox("Compare vs destination park", value=False)
 
-        destination_team = st.selectbox(
-            "Destination team",
-            options=[""] + team_opts,
-            index=0,
-            format_func=lambda t: "" if t == "" else _label_map.get(t, t),
+    destination_mode = "Team"
+    destination_team = None
+    destination_stadium = None
+
+    if compare_mode:
+        destination_mode = st.radio(
+            "Destination selection",
+            options=["Team", "Stadium"],
+            horizontal=True,
+            help="Pick a destination team (uses that team's park factors) or pick a stadium directly (useful for relocations).",
         )
+
+        if destination_mode == "Team":
+            # Always populate from teams actually present in batting table (abbrevs).
+            try:
+                teams_df = cached_team_list(db_path)
+                team_opts = teams_df["abbrev"].dropna().tolist()
+                _label_map = dict(zip(teams_df["abbrev"], teams_df["label"]))
+            except Exception:
+                team_opts = []
+                _label_map = {}
+
+            destination_team = st.selectbox(
+                "Destination team",
+                options=[""] + team_opts,
+                index=0,
+                format_func=lambda t: "" if t == "" else _label_map.get(t, t),
+            )
+
+        else:
+            # Stadium mode: pick a stadium directly. We'll resolve the tenant team (if any)
+            # for target_year and use that team's park factors as a proxy.
+            try:
+                stadiums = cached_stadium_list(db_path)
+                stadium_opts = stadiums["stadium"].dropna().tolist()
+            except Exception:
+                stadium_opts = []
+
+            destination_stadium = st.selectbox(
+                "Destination stadium",
+                options=[""] + stadium_opts,
+                index=0,
+            )
+
     league_years = st.number_input("League mean window (years)", min_value=1, max_value=10, value=3, step=1)
 
 
@@ -132,8 +171,33 @@ def load_team_list(db: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def cached_team_list(db: str) -> pd.DataFrame:
     return load_team_list(db)
+
+
+@st.cache_data(show_spinner=False)
 def cached_player_list(db: str) -> pd.DataFrame:
     return load_player_list(db)
+
+
+def load_stadium_list(db: str) -> pd.DataFrame:
+    conn = sqlite3.connect(db)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT DISTINCT stadium
+            FROM team_stadiums
+            WHERE stadium IS NOT NULL AND trim(stadium) <> ''
+            ORDER BY stadium
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def cached_stadium_list(db: str) -> pd.DataFrame:
+    return load_stadium_list(db)
 
 
 def plot_hist(arr: np.ndarray, title: str):
@@ -189,17 +253,58 @@ if run:
 
     with st.spinner("Running simulations..."):
         conn = connect(db_path)
-        df_base, lg = project_players(
-            conn=conn,
-            player_ids=selected_ids,
-            target_year=int(target_year),
-            sims=int(sims),
-            seed=int(seed),
-            k_ab_prior=int(k_ab),
-            league_years=int(league_years),
-        )
+        if mode == "Pitchers":
+            df_base, lg = project_pitchers(
+                conn=conn,
+                player_ids=selected_ids,
+                target_year=int(target_year),
+                sims=int(sims),
+                seed=int(seed),
+                k_ip=float(k_ip or 100.0),
+                lg_years=int(league_years),
+            )
+        else:
+            df_base, lg = project_players(
+                conn=conn,
+                player_ids=selected_ids,
+                target_year=int(target_year),
+                sims=int(sims),
+                seed=int(seed),
+                k_ab_prior=int(k_ab),
+                league_years=int(league_years),
+            )
 
-        if compare_mode and destination_team:
+        if mode != "Pitchers" and compare_mode and (destination_team or destination_stadium):
+            # Stadium-mode: resolve the "tenant" team for the chosen stadium in target_year
+            # and use that team's park factors as a proxy.
+            override_team = None
+            override_stadium = None
+
+            if destination_mode == "Team" and destination_team:
+                override_team = str(destination_team)
+            elif destination_mode == "Stadium" and destination_stadium:
+                override_stadium = str(destination_stadium)
+                try:
+                    r = conn.execute(
+                        """
+                        SELECT team
+                        FROM team_stadiums
+                        WHERE stadium = ?
+                          AND (? BETWEEN COALESCE(since_year, 0) AND COALESCE(through_year, 9999))
+                        LIMIT 1
+                        """,
+                        (override_stadium, int(target_year)),
+                    ).fetchone()
+                    if r and r["team"]:
+                        # team_stadiums.team is typically full name; map to abbrev if possible
+                        rr = conn.execute(
+                            "SELECT abbrev FROM team_aliases WHERE team_full=? COLLATE NOCASE LIMIT 1",
+                            (str(r["team"]),),
+                        ).fetchone()
+                        override_team = str(rr["abbrev"]) if rr and rr["abbrev"] else None
+                except Exception:
+                    override_team = None
+
             df_dest, _ = project_players(
                 conn=conn,
                 player_ids=selected_ids,
@@ -208,7 +313,8 @@ if run:
                 seed=int(seed),
                 k_ab_prior=int(k_ab),
                 league_years=int(league_years),
-                override_team=str(destination_team),
+                override_team=override_team,
+                override_stadium=override_stadium,
             )
 
             # Merge and compute deltas
@@ -227,6 +333,9 @@ if run:
             )
             df["delta_OPS_p50"] = (df["dest_OPS_p50"] - df["OPS_p50"]).round(3)
             df["delta_HR_p50"] = (df["dest_HR_p50"] - df["HR_p50"]).round(2)
+
+        if mode == "Pitchers" and compare_mode:
+            st.info("Destination park comparison is currently implemented for hitters only.")
         else:
             df = df_base
 
@@ -247,25 +356,54 @@ if run:
     st.dataframe(df, use_container_width=True)
 
     st.subheader("League context (recent)")
-    st.write(
-        {
-            "OBP": round(lg.obp, 3),
-            "SLG": round(lg.slg, 3),
-            "OPS": round(lg.ops, 3),
-            "HR/AB": round(lg.hr_per_ab, 4),
-            "K/AB": round(lg.k_per_ab, 4),
+    if mode == "Pitchers":
+        st.write(
+            {
+                "ERA": round(lg.era, 3),
+                "WHIP": round(lg.whip, 3),
+                "OPS allowed": round(lg.ops_allowed, 3),
+                "K/IP": round(lg.k_per_ip, 3),
+                "BB/IP": round(lg.bb_per_ip, 3),
+            }
+        )
+    else:
+        st.write(
+            {
+                "OBP": round(lg.obp, 3),
+                "SLG": round(lg.slg, 3),
+                "OPS": round(lg.ops, 3),
+                "HR/AB": round(lg.hr_per_ab, 4),
+                "K/AB": round(lg.k_per_ab, 4),
+            }
+        )
 
-        }
-    )
-
-    # Per-player distribution charts (rerun quick per player with same seed offset)
+    # Per-player distribution charts
     st.subheader("Distributions")
     for _, row in df.iterrows():
-        st.markdown(f"### {row['name']} ({int(row['player_id'])}) — {row.get('team','')} @ {row.get('stadium','')}")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("OPS p10 / p50 / p90", f"{row['OPS_p10']:.3f} / {row['OPS_p50']:.3f} / {row['OPS_p90']:.3f}")
-        c2.metric("HR p10 / p50 / p90", f"{int(row['HR_p10'])} / {int(row['HR_p50'])} / {int(row['HR_p90'])}")
-        c3.metric("GB%", f"{row.get('gb_pct', 'NA')}")
-        c4.metric("Var mult", f"{row.get('var_mult','NA')}")
+        if mode == "Pitchers":
+            st.markdown(f"### {row['name']} ({int(row['player_id'])}) — {row.get('team','')}")
+            c1, c2 = st.columns(2)
+            c3, c4 = st.columns(2)
+
+            c1.metric("ERA p10 / p50 / p90", f"{row['ERA_p10']:.2f} / {row['ERA_p50']:.2f} / {row['ERA_p90']:.2f}")
+            c2.metric(
+                "OPS allowed p10 / p50 / p90",
+                f"{row['OPS_allowed_p10']:.3f} / {row['OPS_allowed_p50']:.3f} / {row['OPS_allowed_p90']:.3f}",
+            )
+            c3.metric("WHIP p10 / p50 / p90", f"{row['WHIP_p10']:.2f} / {row['WHIP_p50']:.2f} / {row['WHIP_p90']:.2f}")
+            c4.metric("K/BB p10 / p50 / p90", f"{row['KBB_p10']:.2f} / {row['KBB_p50']:.2f} / {row['KBB_p90']:.2f}")
+
+            # Context row
+            cx1, cx2, cx3 = st.columns(3)
+            cx1.metric("IP proj", f"{row.get('ip_proj', float('nan')):.1f}")
+            cx2.metric("GS last", f"{int(row.get('gs_last', 0))}")
+            cx3.metric("Starter?", "SP" if bool(row.get('is_sp', False)) else "RP")
+        else:
+            st.markdown(f"### {row['name']} ({int(row['player_id'])}) — {row.get('team','')} @ {row.get('stadium','')}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("OPS p10 / p50 / p90", f"{row['OPS_p10']:.3f} / {row['OPS_p50']:.3f} / {row['OPS_p90']:.3f}")
+            c2.metric("HR p10 / p50 / p90", f"{int(row['HR_p10'])} / {int(row['HR_p50'])} / {int(row['HR_p90'])}")
+            c3.metric("GB%", f"{row.get('gb_pct', 'NA')}")
+            c4.metric("Var mult", f"{row.get('var_mult','NA')}")
 
     st.caption("Tip: Change sims/seed to see stability; raise sims for smoother percentiles.")
