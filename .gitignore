@@ -16,3 +16,8 @@ PASTE_THE_EXACT_DB_PATH_HERE
 .venv/
 *.sqlite
 mblc.sqlite
+
+# Local development artifacts
+.venv/
+*.sqlite
+*.bak
