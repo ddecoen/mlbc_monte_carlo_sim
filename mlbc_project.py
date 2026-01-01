@@ -208,7 +208,7 @@ def player_recent_seasons(conn: sqlite3.Connection, player_id: int, n: int = 3) 
         SELECT
           player_id, season_year,
           ab, COALESCE(hr,0) AS hr, COALESCE(bb,0) AS bb, COALESCE(k,0) AS k,
-          obp, slg, ops
+          avg, obp, slg, ops
         FROM player_season_batting
         WHERE player_id = ?
         ORDER BY season_year DESC
@@ -518,6 +518,12 @@ def project_players(
         sims=sims, k_ab=k_ab, lg_years=lg_years, seed=seed, hr_dispersion=hr_dispersion, legacy_kwargs=legacy_kwargs
     )
 
+    # Destination overrides (FA signing / relocation scenarios)
+    override_team = legacy_kwargs.pop("override_team", None)
+    override_stadium = legacy_kwargs.pop("override_stadium", None)
+    home_game_share = float(legacy_kwargs.pop("home_game_share", 0.5) or 0.5)
+    home_game_share = float(np.clip(home_game_share, 0.0, 1.0))
+
     players_list = [int(x) for x in players]
     rng = np.random.default_rng(int(seed_v))
     lg = league_context_recent(conn, recent_years=lg_years_v)
@@ -571,6 +577,27 @@ def project_players(
         recent = player_recent_seasons(conn, int(pid), n=3)
         ops_recent3, ab_recent = weighted_recent_ops(recent)
 
+        # ISO context (not projected): last-season and recent-3 (AB-weighted)
+        iso_last = None
+        iso_recent3 = None
+        try:
+            if recent is not None and not recent.empty and "avg" in recent.columns and "slg" in recent.columns:
+                # last season iso
+                r0 = recent.iloc[0]
+                if r0.get("avg") is not None and r0.get("slg") is not None:
+                    iso_last = float(r0["slg"]) - float(r0["avg"])
+
+                # recent 3 weighted by AB
+                rr = recent.copy()
+                rr = rr[rr["ab"].fillna(0) > 0]
+                if not rr.empty:
+                    iso_series = (rr["slg"].astype(float) - rr["avg"].astype(float))
+                    iso_recent3 = float((iso_series * rr["ab"].astype(float)).sum() / rr["ab"].astype(float).sum())
+        except Exception:
+            iso_last = None
+            iso_recent3 = None
+
+
         if ops_recent3 is None or ab_recent is None:
             out_rows.append(
                 dict(
@@ -582,6 +609,8 @@ def project_players(
                     age=age,
                     ab_proj=None,
                     gb_pct=gb_pct,
+                    ISO_last=iso_last,
+                    ISO_recent3=iso_recent3,
                     park_pf_year=None,
                     park_pf_home_idx=100.0,
                     park_pf_away_idx=100.0,
@@ -614,10 +643,17 @@ def project_players(
             team_raw = (r["team"] if r else None)
 
         team_full = resolve_team_full(conn, str(team_raw) if team_raw is not None else None)
-        stadium = resolve_stadium_for_team_year(conn, team_full or team_raw, int(target_year))
+        # Destination overrides: allow projecting a FA in a new park/team
+        team_for_park = override_team or (team_raw or team_full)
+        stadium = override_stadium or resolve_stadium_for_team_year(conn, team_full or team_raw, int(target_year))
+
+        # If we couldn't resolve via abbrev/full, try using the park team key for stadium lookup too
+        if stadium is None and team_for_park:
+            stadium = resolve_stadium_for_team_year(conn, team_for_park, int(target_year))
+
 
         pf_year = int(target_year) - 1
-        pf_year_used, home_idx, away_idx = get_park_pf_ops_for_team_year(conn, team_full or team_raw, pf_year)
+        pf_year_used, home_idx, away_idx = get_park_pf_ops_for_team_year(conn, team_for_park, pf_year)
         pmult = park_multiplier(home_idx, away_idx)
 
         ops_tt_prepark = estimate_true_talent_ops(
@@ -685,6 +721,8 @@ def project_players(
                 age=age,
                 ab_proj=int(ab_proj),
                 gb_pct=gb_pct,
+                ISO_last=iso_last,
+                ISO_recent3=iso_recent3,
                 park_pf_year=pf_year_used if pf_year_used is not None else pf_year,
                 park_pf_home_idx=float(home_idx),
                 park_pf_away_idx=float(away_idx),
