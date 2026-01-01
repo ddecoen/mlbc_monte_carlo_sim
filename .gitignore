@@ -11,3 +11,8 @@ venv/
 *.bak
 PASTE_THE_PATH_HERE
 PASTE_THE_EXACT_DB_PATH_HERE
+
+# Local development artifacts
+.venv/
+*.sqlite
+mblc.sqlite
