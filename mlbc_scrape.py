@@ -84,12 +84,64 @@ CREATE TABLE IF NOT EXISTS team_stadiums (
 );
 
 
+CREATE TABLE IF NOT EXISTS player_season_pitching (
+  player_id INTEGER NOT NULL,
+  season_year INTEGER NOT NULL,
+  team TEXT,
+  w INTEGER,
+  l INTEGER,
+  era REAL,
+  sv INTEGER,
+  bs INTEGER,
+  g INTEGER,
+  gs INTEGER,
+  cg INTEGER,
+  sho INTEGER,
+  ip REAL,
+  h INTEGER,
+  k INTEGER,
+  bb INTEGER,
+  ops_allowed REAL,
+  whip REAL,
+  PRIMARY KEY(player_id, season_year)
+);
+
+CREATE TABLE IF NOT EXISTS player_splits_pitching (
+  player_id INTEGER NOT NULL,
+  split_group TEXT NOT NULL,
+  split_key TEXT NOT NULL,
+  team TEXT,
+  w INTEGER,
+  l INTEGER,
+  era REAL,
+  sv INTEGER,
+  bs INTEGER,
+  g INTEGER,
+  gs INTEGER,
+  cg INTEGER,
+  sho INTEGER,
+  ip REAL,
+  h INTEGER,
+  doubles INTEGER,
+  triples INTEGER,
+  hr INTEGER,
+  bb INTEGER,
+  k INTEGER,
+  avg REAL,
+  obp REAL,
+  slg REAL,
+  ops REAL,
+  whip REAL,
+  PRIMARY KEY(player_id, split_group, split_key)
+);
+
 CREATE TABLE IF NOT EXISTS team_roster_players (
   team TEXT NOT NULL,
   player_id INTEGER NOT NULL,
   scraped_ts INTEGER,
   PRIMARY KEY(team, player_id)
 );
+
 CREATE TABLE IF NOT EXISTS team_aliases (
   abbrev TEXT PRIMARY KEY,
   team_full TEXT NOT NULL
@@ -178,6 +230,171 @@ def _safe_float(x) -> Optional[float]:
         return None
 
 
+
+
+def _safe_token(x: str) -> Optional[str]:
+    s = (x or "").strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return None
+    return s
+
+
+def _tokenize_collapsed_table_text(text: str) -> List[str]:
+    # collapsed text already has whitespace normalized; split on spaces
+    return [t for t in (text or "").split(" ") if t != ""]
+
+
+def _parse_pitcher_platoon_splits_from_text(text: str, player_id: int) -> List[Dict]:
+    # Header sequence we expect
+    header = [
+        "split", "era", "ip", "h", "2b", "3b", "hr", "bb", "k",
+        "avg", "obp", "slg", "ops", "whip",
+    ]
+
+    tokens = _tokenize_collapsed_table_text(text)
+    # Find header start
+    def find_seq(seq):
+        seq = [s.lower() for s in seq]
+        for i in range(0, len(tokens) - len(seq)):
+            if [t.lower() for t in tokens[i:i+len(seq)]] == seq:
+                return i
+        return None
+
+    hi = find_seq(header)
+    if hi is None:
+        return []
+
+    out: List[Dict] = []
+    i = hi + len(header)
+
+    # Rows look like: vs RH Hitters <era> <ip> <h> <2b> <3b> <hr> <bb> <k> <avg> <obp> <slg> <ops> <whip>
+    # We stop when we reach the situational header 'Split Team W L ...'
+    stop = ["split", "team", "w", "l", "era"]
+
+    while i < len(tokens):
+        # stop check
+        if i + len(stop) <= len(tokens) and [t.lower() for t in tokens[i:i+len(stop)]] == stop:
+            break
+
+        # split key is non-numeric; may be multiple tokens starting with 'vs'
+        if tokens[i].lower() != 'vs':
+            # defensive skip
+            i += 1
+            continue
+
+        # collect split_key tokens until we have enough remaining numeric tokens
+        # platoon keys we expect: vs RH Hitters / vs LH Hitters
+        if i + 3 >= len(tokens):
+            break
+        split_key = " ".join(tokens[i:i+3])
+        i += 3
+
+        vals = tokens[i:i+13]
+        if len(vals) < 13:
+            break
+        i += 13
+
+        row = {
+            "player_id": player_id,
+            "split_group": "platoon",
+            "split_key": split_key,
+            "era": _safe_float(vals[0]),
+            "ip": _safe_float(vals[1]),
+            "h": _safe_int(vals[2]) or 0,
+            "doubles": _safe_int(vals[3]) or 0,
+            "triples": _safe_int(vals[4]) or 0,
+            "hr": _safe_int(vals[5]) or 0,
+            "bb": _safe_int(vals[6]) or 0,
+            "k": _safe_int(vals[7]) or 0,
+            "avg": _safe_float(vals[8]),
+            "obp": _safe_float(vals[9]),
+            "slg": _safe_float(vals[10]),
+            "ops": _safe_float(vals[11]),
+            "whip": _safe_float(vals[12]),
+        }
+        out.append(row)
+
+    return out
+
+
+def _parse_pitcher_situational_splits_from_text(text: str, player_id: int) -> List[Dict]:
+    header = [
+        "split", "team", "w", "l", "era", "sv", "bs", "g", "gs", "sho", "cg",
+        "ip", "h", "k", "bb", "avg", "whip",
+    ]
+
+    tokens = _tokenize_collapsed_table_text(text)
+
+    def find_seq(seq):
+        seq = [s.lower() for s in seq]
+        for i in range(0, len(tokens) - len(seq)):
+            if [t.lower() for t in tokens[i:i+len(seq)]] == seq:
+                return i
+        return None
+
+    hi = find_seq(header)
+    if hi is None:
+        return []
+
+    i = hi + len(header)
+    out: List[Dict] = []
+
+    # split_key is variable-length until we hit a team abbrev token.
+    # team tokens look like 2-4 uppercase letters.
+    TEAM_RE = re.compile(r"^[A-Z]{2,4}$")
+
+    while i < len(tokens):
+        # parse split_key tokens until TEAM token
+        start = i
+        while i < len(tokens) and not TEAM_RE.match(tokens[i]):
+            i += 1
+        if i >= len(tokens):
+            break
+        split_key = " ".join(tokens[start:i]).strip()
+        team = tokens[i]
+        i += 1
+
+        vals = tokens[i:i+14]
+        if len(vals) < 14:
+            break
+        i += 14
+
+        out.append(
+            {
+                "player_id": player_id,
+                "split_group": "situational",
+                "split_key": split_key,
+                "team": team,
+                "w": _safe_int(vals[0]) or 0,
+                "l": _safe_int(vals[1]) or 0,
+                "era": _safe_float(vals[2]),
+                "sv": _safe_int(vals[3]) or 0,
+                "bs": _safe_int(vals[4]) or 0,
+                "g": _safe_int(vals[5]) or 0,
+                "gs": _safe_int(vals[6]) or 0,
+                "sho": _safe_int(vals[7]) or 0,
+                "cg": _safe_int(vals[8]) or 0,
+                "ip": _safe_float(vals[9]),
+                "h": _safe_int(vals[10]) or 0,
+                "k": _safe_int(vals[11]) or 0,
+                "bb": _safe_int(vals[12]) or 0,
+                "avg": _safe_float(vals[13]),
+                "whip": _safe_float(vals[14]) if len(vals) > 14 else None,
+            }
+        )
+
+    return out
+
+
+def scrape_player_splits_pitching(fetcher: Fetcher, player_id: int) -> List[Dict]:
+    url = f"{BASE}/pcardsplit.php?id={player_id}"
+    html_page = fetcher.get(url)
+    text = _collapse_text(html_page)
+
+    out: List[Dict] = []
+    out.extend(_parse_pitcher_platoon_splits_from_text(text, player_id))
+    out.extend(_parse_pitcher_situational_splits_from_text(text, player_id))
+    return out
 def _safe_int(x) -> Optional[int]:
     try:
         if x is None:
@@ -211,6 +428,54 @@ def _promote_first_row_to_header_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
+
+def _score_season_pitching_table(df: pd.DataFrame) -> int:
+    """Heuristic score for identifying the pitching season table on pcard.php."""
+    if df is None or df.empty or df.shape[1] < 6:
+        return -999
+
+    cols = [_norm_col(c) for c in df.columns]
+    colset = set(cols)
+
+    score = 0
+    if any(c in ("year", "season", "yr") or "year" in c for c in cols):
+        score += 6
+    else:
+        score += 1
+
+    # pitching-specific signals
+    for k in ("era", "ip", "whip"):
+        if k in colset:
+            score += 5
+
+    if "ops" in colset or "ops allowed" in colset:
+        score += 3
+
+    for k in ("g", "gs", "w", "l", "bb", "k", "so", "h"):
+        if k in colset:
+            score += 1
+
+    if "ab" in colset:
+        score -= 5  # batting table probably
+
+    return score
+
+
+def _find_best_season_pitching_df(dfs: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    best_df = None
+    best_score = -9999
+    for df in dfs:
+        df2 = _promote_first_row_to_header_if_needed(df)
+        df2.columns = [str(c) for c in df2.columns]
+        sc = _score_season_pitching_table(df2)
+        if sc > best_score:
+            best_score = sc
+            best_df = df2
+
+    if best_score < 10:
+        return None
+    return best_df
 def _score_season_table(df: pd.DataFrame) -> int:
     if df is None or df.empty or df.shape[1] < 4:
         return -999
@@ -442,6 +707,102 @@ def scrape_player_card(fetcher: Fetcher, player_id: int) -> Tuple[Dict[str, Opti
 
 
 def scrape_player_edits(fetcher: Fetcher, player_id: int) -> Dict[str, Optional[float]]:
+    url = f"{BASE}/pcarde.php?id={player_id}"
+    html_page = fetcher.get(url)
+
+    gb = None
+    try:
+        dfs = _read_html_tables(html_page)
+        gb = _extract_gb_pct_from_tables(dfs)
+    except Exception:
+        gb = None
+
+    if gb is None:
+        text = _collapse_text(html_page)
+        gb = _extract_gb_pct_from_text(text)
+
+    return {"gb_pct": gb}
+
+
+def scrape_player_card_pitching(fetcher: Fetcher, player_id: int) -> List[Dict]:
+    """Scrape pitching season lines from pcard.php.
+
+    Returns list of dicts suitable for player_season_pitching.
+    """
+    url = f"{BASE}/pcard.php?id={player_id}"
+    html_page = fetcher.get(url)
+
+    dfs = _read_html_tables(html_page)
+    df = _find_best_season_pitching_df(dfs)
+    if df is None:
+        return []
+
+    df.columns = [_norm_col(c) for c in df.columns]
+
+    ycol = None
+    for c in df.columns:
+        if c in ("year", "season", "yr") or "year" in c:
+            ycol = c
+            break
+    if ycol is None:
+        ycol = df.columns[0]
+
+    colmap = {
+        "team": "team",
+        "w": "w",
+        "l": "l",
+        "era": "era",
+        "sv": "sv",
+        "bs": "bs",
+        "g": "g",
+        "gs": "gs",
+        "cg": "cg",
+        "sho": "sho",
+        "ip": "ip",
+        "h": "h",
+        "so": "k",
+        "k": "k",
+        "bb": "bb",
+        "ops": "ops_allowed",
+        "whip": "whip",
+    }
+    df = df.rename(columns={c: colmap[c] for c in df.columns if c in colmap})
+
+    seasons: List[Dict] = []
+    for _, r in df.iterrows():
+        year = _safe_int(r.get(ycol))
+        if year is None:
+            continue
+
+        ip = _safe_float(r.get("ip"))
+        # skip empty rows
+        if ip is None or ip <= 0:
+            continue
+
+        seasons.append(
+            {
+                "player_id": player_id,
+                "season_year": year,
+                "team": (str(r.get("team")).strip() if r.get("team") is not None else None),
+                "w": _safe_int(r.get("w")) or 0,
+                "l": _safe_int(r.get("l")) or 0,
+                "era": _safe_float(r.get("era")),
+                "sv": _safe_int(r.get("sv")) or 0,
+                "bs": _safe_int(r.get("bs")) or 0,
+                "g": _safe_int(r.get("g")) or 0,
+                "gs": _safe_int(r.get("gs")) or 0,
+                "cg": _safe_int(r.get("cg")) or 0,
+                "sho": _safe_int(r.get("sho")) or 0,
+                "ip": ip,
+                "h": _safe_int(r.get("h")) or 0,
+                "k": _safe_int(r.get("k")) or 0,
+                "bb": _safe_int(r.get("bb")) or 0,
+                "ops_allowed": _safe_float(r.get("ops_allowed")),
+                "whip": _safe_float(r.get("whip")),
+            }
+        )
+
+    return seasons
     url = f"{BASE}/pcarde.php?id={player_id}"
     html_page = fetcher.get(url)
 
@@ -754,6 +1115,87 @@ def upsert_player(conn: sqlite3.Connection, player_id: int, fields: Dict[str, Op
     )
 
 
+
+
+def replace_player_seasons_pitching(conn: sqlite3.Connection, seasons: List[Dict]) -> None:
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO player_season_pitching(
+          player_id, season_year, team,
+          w, l, era, sv, bs, g, gs, cg, sho,
+          ip, h, k, bb,
+          ops_allowed, whip
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        [
+            (
+                s["player_id"],
+                s["season_year"],
+                s.get("team"),
+                s.get("w"),
+                s.get("l"),
+                s.get("era"),
+                s.get("sv"),
+                s.get("bs"),
+                s.get("g"),
+                s.get("gs"),
+                s.get("cg"),
+                s.get("sho"),
+                s.get("ip"),
+                s.get("h"),
+                s.get("k"),
+                s.get("bb"),
+                s.get("ops_allowed"),
+                s.get("whip"),
+            )
+            for s in seasons
+        ],
+    )
+
+
+def replace_player_splits_pitching(conn: sqlite3.Connection, splits: List[Dict]) -> None:
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO player_splits_pitching(
+          player_id, split_group, split_key,
+          team, w, l, era, sv, bs, g, gs, cg, sho,
+          ip, h, doubles, triples, hr, bb, k,
+          avg, obp, slg, ops, whip
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        [
+            (
+                r["player_id"],
+                r["split_group"],
+                r["split_key"],
+                r.get("team"),
+                r.get("w"),
+                r.get("l"),
+                r.get("era"),
+                r.get("sv"),
+                r.get("bs"),
+                r.get("g"),
+                r.get("gs"),
+                r.get("cg"),
+                r.get("sho"),
+                r.get("ip"),
+                r.get("h"),
+                r.get("doubles"),
+                r.get("triples"),
+                r.get("hr"),
+                r.get("bb"),
+                r.get("k"),
+                r.get("avg"),
+                r.get("obp"),
+                r.get("slg"),
+                r.get("ops"),
+                r.get("whip"),
+            )
+            for r in splits
+        ],
+    )
 def replace_player_seasons(conn: sqlite3.Connection, seasons: List[Dict]) -> None:
     conn.executemany(
         """
@@ -877,20 +1319,44 @@ def replace_team_stadiums(conn: sqlite3.Connection, rows: List[Dict]) -> None:
 # ----------------------------
 # Ingest
 # ----------------------------
-def ingest_players(conn: sqlite3.Connection, fetcher: Fetcher, player_ids: Sequence[int], do_splits: bool) -> None:
+def ingest_players(
+    conn: sqlite3.Connection,
+    fetcher: Fetcher,
+    player_ids: Sequence[int],
+    *,
+    do_splits_batting: bool,
+    do_pitching: bool,
+    do_splits_pitching: bool,
+) -> None:
     for pid in player_ids:
         try:
-            fields, seasons = scrape_player_card(fetcher, pid)
+            fields, seasons_bat = scrape_player_card(fetcher, pid)
             edits = scrape_player_edits(fetcher, pid)
             upsert_player(conn, pid, fields, edits.get("gb_pct"))
-            if seasons:
-                replace_player_seasons(conn, seasons)
-            if do_splits:
+
+            if seasons_bat:
+                replace_player_seasons(conn, seasons_bat)
+
+            if do_splits_batting:
                 sp = scrape_player_splits(fetcher, pid)
                 if sp:
                     replace_player_splits(conn, sp)
+
+            if do_pitching:
+                seasons_p = scrape_player_card_pitching(fetcher, pid)
+                if seasons_p:
+                    replace_player_seasons_pitching(conn, seasons_p)
+
+            if do_splits_pitching:
+                ps = scrape_player_splits_pitching(fetcher, pid)
+                if ps:
+                    replace_player_splits_pitching(conn, ps)
+
             conn.commit()
-            print(f"Saved player {pid}: seasons={len(seasons)} gb_pct={edits.get('gb_pct')}", flush=True)
+            print(
+                f"Saved player {pid}: bat_seasons={len(seasons_bat)} pitch_seasons={len(locals().get('seasons_p', []) or [])} gb_pct={edits.get('gb_pct')}",
+                flush=True,
+            )
         except Exception as e:
             conn.rollback()
             print(f"[WARN] player {pid} failed: {e}", file=sys.stderr, flush=True)
@@ -904,14 +1370,30 @@ def ingest_stadiums(conn: sqlite3.Connection, fetcher: Fetcher) -> None:
     print(f"Saved stadiums: rows={len(rows)}", flush=True)
 
 
-def ingest_all(conn: sqlite3.Connection, fetcher: Fetcher, do_splits: bool, limit: Optional[int], start_at: int) -> None:
+def ingest_all(
+    conn: sqlite3.Connection,
+    fetcher: Fetcher,
+    *,
+    do_splits_batting: bool,
+    do_pitching: bool,
+    do_splits_pitching: bool,
+    limit: Optional[int],
+    start_at: int,
+) -> None:
     ids = [r[0] for r in conn.execute("SELECT player_id FROM player_ids ORDER BY player_id").fetchall()]
     if start_at:
         ids = ids[start_at:]
     if limit is not None:
         ids = ids[:limit]
     print(f"Starting ingest-all: {len(ids)} player IDs", flush=True)
-    ingest_players(conn, fetcher, ids, do_splits=do_splits)
+    ingest_players(
+        conn,
+        fetcher,
+        ids,
+        do_splits_batting=do_splits_batting,
+        do_pitching=do_pitching,
+        do_splits_pitching=do_splits_pitching,
+    )
 
 
 # ----------------------------
@@ -935,7 +1417,9 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=25.0)
 
     ap.add_argument("--players", nargs="*", type=int, default=[])
-    ap.add_argument("--splits", action="store_true")
+    ap.add_argument("--splits", action="store_true", help="Scrape batting splits")
+    ap.add_argument("--pitching", action="store_true", help="Scrape pitching season stats")
+    ap.add_argument("--pitching-splits", action="store_true", help="Scrape pitching splits (platoon + situational)")
 
     ap.add_argument("--stadiums", action="store_true")
 
@@ -973,10 +1457,25 @@ def main() -> None:
         ingest_stadiums(conn, fetcher)
 
     if args.players:
-        ingest_players(conn, fetcher, args.players, do_splits=args.splits)
+        ingest_players(
+            conn,
+            fetcher,
+            args.players,
+            do_splits_batting=args.splits,
+            do_pitching=args.pitching,
+            do_splits_pitching=args.pitching_splits,
+        )
 
     if args.ingest_all:
-        ingest_all(conn, fetcher, do_splits=args.splits, limit=args.limit, start_at=args.start_at)
+        ingest_all(
+            conn,
+            fetcher,
+            do_splits_batting=args.splits,
+            do_pitching=args.pitching,
+            do_splits_pitching=args.pitching_splits,
+            limit=args.limit,
+            start_at=args.start_at,
+        )
 
     conn.close()
 
