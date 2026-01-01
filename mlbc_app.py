@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 
 # Import the engine from mlbc_project.py
 from mlbc_project import connect, project_players
+import mlbc_project, inspect
+st.sidebar.caption(f"mlbc_project file: {mlbc_project.__file__}")
+st.sidebar.caption(f"override_stadium supported: {'override_stadium' in inspect.getsource(mlbc_project.project_players)}")
+
 
 
 st.set_page_config(page_title="MLBC Projections", layout="wide")
@@ -60,15 +64,74 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Free Agent / destination park")
-    compare_mode = st.checkbox("Compare vs destination team park", value=False)
+    compare_mode = st.checkbox("Compare vs destination park", value=False)
+
+    destination_mode = "Team"
     destination_team = None
+    destination_stadium = None
+
     if compare_mode:
-        try:
-            teams_df = cached_team_list(db_path)
-            team_opts = teams_df["team"].dropna().tolist()
-        except Exception:
-            team_opts = []
-        destination_team = st.selectbox("Destination team", options=[""] + team_opts, index=0)
+        destination_mode = st.radio(
+            "Destination selection",
+            options=["Team", "Stadium"],
+            horizontal=True,
+            help="Team uses that team's park factors. Stadium is useful for relocations; we resolve the tenant team (if any) for PF proxy.",
+        )
+
+        if destination_mode == "Team":
+            try:
+                conn_tmp = sqlite3.connect(db_path)
+                try:
+                    teams_df = pd.read_sql_query(
+                        """
+                        SELECT DISTINCT team AS abbrev
+                        FROM player_season_batting
+                        WHERE team IS NOT NULL AND trim(team) <> ''
+                        ORDER BY team
+                        """,
+                        conn_tmp,
+                    )
+                    teams_df["label"] = teams_df["abbrev"]
+                finally:
+                    conn_tmp.close()
+                team_opts = teams_df["abbrev"].dropna().tolist()
+                _label_map = dict(zip(teams_df["abbrev"], teams_df["label"]))
+            except Exception as e:
+                st.sidebar.error(f"Destination team list error: {e}")
+                team_opts = []
+                _label_map = {}
+
+            destination_team = st.selectbox(
+                "Destination team",
+                options=[""] + team_opts,
+                index=0,
+                format_func=lambda t: "" if t == "" else _label_map.get(t, t),
+            )
+        else:
+            try:
+                conn_tmp = sqlite3.connect(db_path)
+                try:
+                    stadiums_df = pd.read_sql_query(
+                        """
+                        SELECT DISTINCT stadium
+                        FROM team_stadiums
+                        WHERE stadium IS NOT NULL AND trim(stadium) <> ''
+                        ORDER BY stadium
+                        """,
+                        conn_tmp,
+                    )
+                finally:
+                    conn_tmp.close()
+                stadium_opts = stadiums_df["stadium"].dropna().tolist()
+            except Exception as e:
+                st.sidebar.error(f"Destination stadium list error: {e}")
+                stadium_opts = []
+
+            destination_stadium = st.selectbox(
+                "Destination stadium",
+                options=[""] + stadium_opts,
+                index=0,
+            )
     league_years = st.number_input("League mean window (years)", min_value=1, max_value=10, value=3, step=1)
 
 
@@ -87,23 +150,59 @@ def load_player_list(db: str) -> pd.DataFrame:
 def load_team_list(db: str) -> pd.DataFrame:
     conn = sqlite3.connect(db)
     try:
-        # Prefer aliases table if present; fallback to player_season_batting
-        try:
-            df = pd.read_sql_query(
-                "SELECT DISTINCT team_full AS team FROM team_aliases WHERE team_full IS NOT NULL AND trim(team_full)<>'' ORDER BY team_full",
-                conn,
-            )
-        except Exception:
-            df = pd.DataFrame()
+        # Always start from teams that actually appear in the batting table.
+        teams = pd.read_sql_query(
+            """
+            SELECT DISTINCT team AS abbrev
+            FROM player_season_batting
+            WHERE team IS NOT NULL AND trim(team) <> ''
+            ORDER BY team
+            """,
+            conn,
+        )
 
-        if df.empty:
-            df = pd.read_sql_query(
-                "SELECT DISTINCT team AS team FROM player_season_batting WHERE team IS NOT NULL AND trim(team)<>'' ORDER BY team",
+        # Optional: map abbrev -> team_full if team_aliases exists.
+        try:
+            aliases = pd.read_sql_query(
+                "SELECT abbrev, team_full FROM team_aliases",
                 conn,
             )
+            teams = teams.merge(aliases, on="abbrev", how="left")
+        except Exception:
+            teams["team_full"] = None
+
+        def _label(row) -> str:
+            ab = str(row["abbrev"])
+            tf = row.get("team_full", None)
+            if tf is not None and str(tf).strip():
+                return f"{ab} — {str(tf).strip()}"
+            return ab
+
+        teams["label"] = teams.apply(_label, axis=1)
+        return teams
+    finally:
+        conn.close()
+
+
+def load_stadium_list(db: str) -> pd.DataFrame:
+    conn = sqlite3.connect(db)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT DISTINCT stadium
+            FROM team_stadiums
+            WHERE stadium IS NOT NULL AND trim(stadium) <> ''
+            ORDER BY stadium
+            """,
+            conn,
+        )
     finally:
         conn.close()
     return df
+
+@st.cache_data(show_spinner=False)
+def cached_stadium_list(db: str) -> pd.DataFrame:
+    return load_stadium_list(db)
 
 
 @st.cache_data(show_spinner=False)
@@ -131,12 +230,31 @@ except Exception as e:
 q = st.text_input("Search player name (substring)", value="Sung")
 filtered = players_df[players_df["name"].str.contains(q, case=False, na=False)].head(50)
 
+# IMPORTANT: keep selection options stable.
+# If options are tied to the filtered list, Streamlit reruns can clear selections,
+# making it look like "Run projections" does nothing.
+all_player_ids = players_df["player_id"].tolist()
+
+st.caption(f"Search matches (showing up to 50): {len(filtered)}")
+
 selected_ids: List[int] = st.multiselect(
     "Select players (up to 10 recommended)",
-    options=filtered["player_id"].tolist(),
+    options=all_player_ids,
     format_func=lambda pid: f"{pid} - {players_df.loc[players_df['player_id']==pid, 'name'].values[0]}",
-    default=[2030] if 2030 in filtered["player_id"].tolist() else [],
+    default=[2030] if 2030 in all_player_ids else [],
 )
+
+# Convenience quick-pick from current filtered results
+quick_pick = st.selectbox(
+    "Quick pick from search results",
+    options=[""] + filtered["player_id"].tolist(),
+    index=0,
+    format_func=lambda pid: "" if pid == "" else f"{pid} - {players_df.loc[players_df['player_id']==pid, 'name'].values[0]}",
+)
+if quick_pick:
+    pid = int(quick_pick)
+    if pid not in selected_ids:
+        selected_ids = selected_ids + [pid]
 
 run = st.button("Run projections")
 
@@ -157,7 +275,44 @@ if run:
             league_years=int(league_years),
         )
 
-        if compare_mode and destination_team:
+        if compare_mode and (destination_team or destination_stadium):
+            # Stadium-mode: resolve tenant team for the chosen stadium in target_year and
+            # use that team's PF indices as a proxy. Also override displayed stadium.
+            override_team = None
+            override_stadium = None
+
+            if destination_mode == "Team" and destination_team:
+                override_team = str(destination_team)
+
+            elif destination_mode == "Stadium" and destination_stadium:
+                override_stadium = str(destination_stadium)
+
+                # Find tenant team (full name) for that stadium/year
+                try:
+                    r = conn.execute(
+                        """
+                        SELECT team
+                        FROM team_stadiums
+                        WHERE stadium = ?
+                          AND (? BETWEEN COALESCE(since_year, 0) AND COALESCE(through_year, 9999))
+                        LIMIT 1
+                        """,
+                        (override_stadium, int(target_year)),
+                    ).fetchone()
+
+                    if r and r["team"]:
+                        # team_stadiums.team is usually full name; map to abbrev if possible
+                        rr = conn.execute(
+                            "SELECT abbrev FROM team_aliases WHERE team_full=? COLLATE NOCASE LIMIT 1",
+                            (str(r["team"]),),
+                        ).fetchone()
+                        if rr and rr["abbrev"]:
+                            override_team = str(rr["abbrev"])
+                except Exception:
+                    pass
+
+            st.sidebar.caption(f"DEBUG override_team={override_team} override_stadium={override_stadium}")
+
             df_dest, _ = project_players(
                 conn=conn,
                 player_ids=selected_ids,
@@ -166,18 +321,23 @@ if run:
                 seed=int(seed),
                 k_ab_prior=int(k_ab),
                 league_years=int(league_years),
-                override_team=str(destination_team),
+                override_team=override_team,
+                override_stadium=override_stadium,
             )
 
             # Merge and compute deltas
             df = df_base.merge(
-                df_dest[["player_id", "team", "stadium", "park_mult", "OPS_p50", "HR_p50"]].rename(
+                df_dest[["player_id", "team", "stadium", "park_mult", "OPS_p10", "OPS_p50", "OPS_p90", "HR_p10", "HR_p50", "HR_p90"]].rename(
                     columns={
                         "team": "dest_team",
                         "stadium": "dest_stadium",
                         "park_mult": "dest_park_mult",
                         "OPS_p50": "dest_OPS_p50",
                         "HR_p50": "dest_HR_p50",
+                        "OPS_p10": "dest_OPS_p10",
+                        "OPS_p90": "dest_OPS_p90",
+                        "HR_p10": "dest_HR_p10",
+                        "HR_p90": "dest_HR_p90",
                     }
                 ),
                 on="player_id",
@@ -185,20 +345,25 @@ if run:
             )
             df["delta_OPS_p50"] = (df["dest_OPS_p50"] - df["OPS_p50"]).round(3)
             df["delta_HR_p50"] = (df["dest_HR_p50"] - df["HR_p50"]).round(2)
+            df["delta_OPS_p10"] = (df["dest_OPS_p10"] - df["OPS_p10"]).round(3)
+            df["delta_OPS_p90"] = (df["dest_OPS_p90"] - df["OPS_p90"]).round(3)
+            df["delta_HR_p10"] = (df["dest_HR_p10"] - df["HR_p10"]).round(2)
+            df["delta_HR_p90"] = (df["dest_HR_p90"] - df["HR_p90"]).round(2)
         else:
             df = df_base
 
         conn.close()
 
     if df.empty:
-    	st.warning("No results for the selected player(s).")
-    	st.info(
-        "This usually means the player has not been ingested into the database yet (missing rows in `player_season_batting`).\n\n"
-        "Fix: update the DB by running the scraper with either:\n"
-        "- `--ingest-all` (recommended for shared/hosted DB updates), or\n"
-        "- `--players <player_id>` to ingest a specific free agent."
-    )
-    st.stop()
+        st.warning("No results for the selected player(s).")
+        st.info(
+            "This usually means the player has not been ingested into the database yet (missing rows in `player_season_batting`).\n\n"
+            "Fix: update the DB by running the scraper with either:\n"
+            "- `--ingest-all` (recommended for shared/hosted DB updates), or\n"
+            "- `--players <player_id>` to ingest a specific free agent.\n\n"
+            "For commissioners: for hosted DB updates, run `--discover-players` then `--ingest-all`."
+        )
+        st.stop()
 
     st.subheader("Results table")
     st.dataframe(df, use_container_width=True)
