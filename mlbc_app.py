@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 
 # Import the engine from mlbc_project.py
 from mlbc_project import connect, project_players
+import mlbc_project, inspect
+st.sidebar.caption(f"mlbc_project file: {mlbc_project.__file__}")
+st.sidebar.caption(f"override_stadium supported: {'override_stadium' in inspect.getsource(mlbc_project.project_players)}")
+
 
 
 st.set_page_config(page_title="MLBC Projections", layout="wide")
@@ -76,10 +80,24 @@ with st.sidebar:
 
         if destination_mode == "Team":
             try:
-                teams_df = cached_team_list(db_path)
+                conn_tmp = sqlite3.connect(db_path)
+                try:
+                    teams_df = pd.read_sql_query(
+                        """
+                        SELECT DISTINCT team AS abbrev
+                        FROM player_season_batting
+                        WHERE team IS NOT NULL AND trim(team) <> ''
+                        ORDER BY team
+                        """,
+                        conn_tmp,
+                    )
+                    teams_df["label"] = teams_df["abbrev"]
+                finally:
+                    conn_tmp.close()
                 team_opts = teams_df["abbrev"].dropna().tolist()
                 _label_map = dict(zip(teams_df["abbrev"], teams_df["label"]))
-            except Exception:
+            except Exception as e:
+                st.sidebar.error(f"Destination team list error: {e}")
                 team_opts = []
                 _label_map = {}
 
@@ -91,9 +109,22 @@ with st.sidebar:
             )
         else:
             try:
-                stadiums_df = cached_stadium_list(db_path)
+                conn_tmp = sqlite3.connect(db_path)
+                try:
+                    stadiums_df = pd.read_sql_query(
+                        """
+                        SELECT DISTINCT stadium
+                        FROM team_stadiums
+                        WHERE stadium IS NOT NULL AND trim(stadium) <> ''
+                        ORDER BY stadium
+                        """,
+                        conn_tmp,
+                    )
+                finally:
+                    conn_tmp.close()
                 stadium_opts = stadiums_df["stadium"].dropna().tolist()
-            except Exception:
+            except Exception as e:
+                st.sidebar.error(f"Destination stadium list error: {e}")
                 stadium_opts = []
 
             destination_stadium = st.selectbox(
@@ -280,6 +311,8 @@ if run:
                 except Exception:
                     pass
 
+            st.sidebar.caption(f"DEBUG override_team={override_team} override_stadium={override_stadium}")
+
             df_dest, _ = project_players(
                 conn=conn,
                 player_ids=selected_ids,
@@ -294,13 +327,17 @@ if run:
 
             # Merge and compute deltas
             df = df_base.merge(
-                df_dest[["player_id", "team", "stadium", "park_mult", "OPS_p50", "HR_p50"]].rename(
+                df_dest[["player_id", "team", "stadium", "park_mult", "OPS_p10", "OPS_p50", "OPS_p90", "HR_p10", "HR_p50", "HR_p90"]].rename(
                     columns={
                         "team": "dest_team",
                         "stadium": "dest_stadium",
                         "park_mult": "dest_park_mult",
                         "OPS_p50": "dest_OPS_p50",
                         "HR_p50": "dest_HR_p50",
+                        "OPS_p10": "dest_OPS_p10",
+                        "OPS_p90": "dest_OPS_p90",
+                        "HR_p10": "dest_HR_p10",
+                        "HR_p90": "dest_HR_p90",
                     }
                 ),
                 on="player_id",
@@ -308,6 +345,10 @@ if run:
             )
             df["delta_OPS_p50"] = (df["dest_OPS_p50"] - df["OPS_p50"]).round(3)
             df["delta_HR_p50"] = (df["dest_HR_p50"] - df["HR_p50"]).round(2)
+            df["delta_OPS_p10"] = (df["dest_OPS_p10"] - df["OPS_p10"]).round(3)
+            df["delta_OPS_p90"] = (df["dest_OPS_p90"] - df["OPS_p90"]).round(3)
+            df["delta_HR_p10"] = (df["dest_HR_p10"] - df["HR_p10"]).round(2)
+            df["delta_HR_p90"] = (df["dest_HR_p90"] - df["HR_p90"]).round(2)
         else:
             df = df_base
 
