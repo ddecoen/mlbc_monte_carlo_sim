@@ -4,3 +4,10 @@ venv/
 .DS_Store
 *.pyc
 
+
+# Local artifacts
+.venv/
+*.sqlite
+*.bak
+PASTE_THE_PATH_HERE
+PASTE_THE_EXACT_DB_PATH_HERE
