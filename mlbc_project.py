@@ -167,6 +167,387 @@ class LeagueContext:
     k_per_ab: float
 
 
+
+
+# -----------------------------
+# Pitching: league context + player stats
+# -----------------------------
+@dataclass
+class PitchingLeagueContext:
+    era: float
+    whip: float
+    ops_allowed: float
+    k_per_ip: float
+    bb_per_ip: float
+
+
+def pitching_league_context_recent(conn: sqlite3.Connection, recent_years: int = 3) -> PitchingLeagueContext:
+    """League averages from player_season_pitching over the most recent N years."""
+    try:
+        max_year = conn.execute("SELECT MAX(season_year) AS y FROM player_season_pitching").fetchone()
+    except sqlite3.OperationalError:
+        # reasonable defaults
+        return PitchingLeagueContext(era=4.50, whip=1.35, ops_allowed=0.720, k_per_ip=0.90, bb_per_ip=0.33)
+
+    if not max_year or max_year["y"] is None:
+        return PitchingLeagueContext(era=4.50, whip=1.35, ops_allowed=0.720, k_per_ip=0.90, bb_per_ip=0.33)
+
+    y0 = int(max_year["y"])
+    years = [y0 - i for i in range(max(1, int(recent_years)))]
+
+    q = f"""
+    SELECT
+      SUM(era * ip) / NULLIF(SUM(ip), 0) AS era,
+      SUM(whip * ip) / NULLIF(SUM(ip), 0) AS whip,
+      SUM(ops_allowed * ip) / NULLIF(SUM(ip), 0) AS ops_allowed,
+      SUM(COALESCE(k,0)) / NULLIF(SUM(ip), 0) AS k_per_ip,
+      SUM(COALESCE(bb,0)) / NULLIF(SUM(ip), 0) AS bb_per_ip
+    FROM player_season_pitching
+    WHERE season_year IN ({",".join(["?"] * len(years))})
+      AND ip IS NOT NULL AND ip > 0
+      AND era IS NOT NULL
+    """
+
+    r = conn.execute(q, years).fetchone()
+
+    era = float(r["era"]) if r and r["era"] is not None else 4.50
+    whip = float(r["whip"]) if r and r["whip"] is not None else 1.35
+    ops_allowed = float(r["ops_allowed"]) if r and r["ops_allowed"] is not None else 0.720
+    k_per_ip = float(r["k_per_ip"]) if r and r["k_per_ip"] is not None else 0.90
+    bb_per_ip = float(r["bb_per_ip"]) if r and r["bb_per_ip"] is not None else 0.33
+
+    return PitchingLeagueContext(era=era, whip=whip, ops_allowed=ops_allowed, k_per_ip=k_per_ip, bb_per_ip=bb_per_ip)
+
+
+def pitcher_recent_seasons(conn: sqlite3.Connection, player_id: int, n: int = 3) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        """
+        SELECT
+          player_id, season_year,
+          team, g, gs, ip,
+          era, ops_allowed, whip,
+          COALESCE(k,0) AS k, COALESCE(bb,0) AS bb
+        FROM player_season_pitching
+        WHERE player_id = ?
+        ORDER BY season_year DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(player_id, n),
+    )
+    return df
+
+
+def _weighted_recent_rate(df_recent: pd.DataFrame, value_col: str, weight_col: str) -> Tuple[Optional[float], Optional[float]]:
+    if df_recent is None or df_recent.empty:
+        return None, None
+    df = df_recent[df_recent[weight_col].fillna(0) > 0].copy()
+    if df.empty:
+        return None, None
+    w = df[weight_col].astype(float).to_numpy()
+    v = df[value_col].astype(float).to_numpy()
+    return float(np.average(v, weights=w)), float(w.sum())
+
+
+def estimate_true_talent_rate(rate_recent: float, w_recent: float, lg_rate: float, k_w: float) -> float:
+    w_recent = max(0.0, float(w_recent))
+    k_w = max(1.0, float(k_w))
+    return float((rate_recent * w_recent + lg_rate * k_w) / (w_recent + k_w))
+
+
+def simulate_pitching(
+    rng: np.random.Generator,
+    sims: int,
+    *,
+    era_mu: float,
+    ops_mu: float,
+    whip_mu: float,
+    k_per_ip_mu: float,
+    bb_per_ip_mu: float,
+    ip_proj: float,
+    # dispersions
+    era_sigma: float,
+    ops_sigma: float,
+    whip_sigma: float,
+    # correlation between "good" outcomes
+    corr: float = 0.45,
+) -> Dict[str, np.ndarray]:
+    sims = int(max(1, sims))
+    ip_proj = float(max(1.0, ip_proj))
+
+    # Shared skill shock: negative => better pitcher (lower ERA/OPS/WHIP, higher K, lower BB)
+    z1 = rng.standard_normal(size=sims)
+    z2 = rng.standard_normal(size=sims)
+    z_skill = z1
+    z2 = corr * z1 + math.sqrt(max(1e-9, 1 - corr * corr)) * z2
+
+    # Rate stats: clamp to plausible ranges.
+    era = np.clip(era_mu + (-z_skill) * float(era_sigma), 0.50, 12.00)
+    ops = np.clip(ops_mu + (-z_skill) * float(ops_sigma), 0.350, 1.200)
+    whip = np.clip(whip_mu + (-z_skill) * float(whip_sigma), 0.60, 2.50)
+
+    # K/BB: model K and BB counts from Poisson on rates, using same z_skill.
+    k_per_ip = np.clip(k_per_ip_mu * (1.0 + 0.12 * (-z_skill)), 0.10, 2.50)
+    bb_per_ip = np.clip(bb_per_ip_mu * (1.0 + 0.18 * (z_skill)), 0.01, 1.50)
+
+    k = rng.poisson(lam=np.clip(k_per_ip * ip_proj, 0.1, 1e9))
+    bb = rng.poisson(lam=np.clip(bb_per_ip * ip_proj, 0.1, 1e9))
+
+    return {
+        "ERA": era,
+        "OPS_allowed": ops,
+        "WHIP": whip,
+        "K": k.astype(int),
+        "BB": bb.astype(int),
+    }
+
+
+def project_pitchers(
+    conn: sqlite3.Connection,
+    pitchers: Optional[Sequence[int]] = None,
+    *,
+    player_ids: Optional[Sequence[int]] = None,
+    target_year: int,
+    sims: int = 5000,
+    k_ip: float = 100.0,
+    lg_years: int = 3,
+    seed: int = 7,
+) -> Tuple[pd.DataFrame, PitchingLeagueContext]:
+    """Pitcher projections (ERA, OPS allowed, WHIP, K/BB, plus IP context).
+
+    - Regresses recent rates to league rates using k_ip (innings-equivalent prior)
+    - Monte Carlo simulates correlated outcomes
+
+    NOTE: Requires player_season_pitching to exist.
+    """
+    if pitchers is None and player_ids is None:
+        raise ValueError("Provide pitchers= or player_ids=")
+    if pitchers is None:
+        pitchers = player_ids
+    assert pitchers is not None
+
+    rng = np.random.default_rng(int(seed))
+    lg = pitching_league_context_recent(conn, recent_years=int(lg_years))
+
+    out_rows: List[Dict[str, Any]] = []
+
+    for pid in [int(x) for x in pitchers]:
+        prow = conn.execute(
+            "SELECT player_id, name, birth_or_age_text FROM players WHERE player_id=?",
+            (int(pid),),
+        ).fetchone()
+        name = prow["name"] if prow and prow["name"] else f"player_{pid}"
+
+        recent = pitcher_recent_seasons(conn, int(pid), n=3)
+        if recent is None or recent.empty:
+            out_rows.append(
+                {
+                    "player_id": int(pid),
+                    "name": name,
+                    "target_year": int(target_year),
+                    "team": None,
+                    "gs_recent": None,
+                    "ip_proj": None,
+                    "ERA_p10": None,
+                    "ERA_p50": None,
+                    "ERA_p90": None,
+                    "OPS_allowed_p10": None,
+                    "OPS_allowed_p50": None,
+                    "OPS_allowed_p90": None,
+                    "WHIP_p10": None,
+                    "WHIP_p50": None,
+                    "WHIP_p90": None,
+                    "KBB_p10": None,
+                    "KBB_p50": None,
+                    "KBB_p90": None,
+                }
+            )
+            continue
+
+        team = str(recent.iloc[0]["team"]) if "team" in recent.columns else None
+        team = team if team and team.lower() not in ("nan", "none") else None
+
+        # Recent weighted by IP
+        era_recent, ip_recent = _weighted_recent_rate(recent, "era", "ip")
+        ops_recent, _ = _weighted_recent_rate(recent, "ops_allowed", "ip")
+        whip_recent, _ = _weighted_recent_rate(recent, "whip", "ip")
+
+        # K/BB rates from totals over recent IP
+        ip_sum = float(recent["ip"].fillna(0).sum())
+        k_sum = float(recent["k"].fillna(0).sum())
+        bb_sum = float(recent["bb"].fillna(0).sum())
+        k_per_ip_recent = (k_sum / ip_sum) if ip_sum > 0 else None
+        bb_per_ip_recent = (bb_sum / ip_sum) if ip_sum > 0 else None
+
+        if era_recent is None or ip_recent is None or ip_recent <= 0:
+            # can't project without any IP
+            out_rows.append(
+                {
+                    "player_id": int(pid),
+                    "name": name,
+                    "target_year": int(target_year),
+                    "team": team,
+                    "gs_recent": int(recent["gs"].fillna(0).sum()) if "gs" in recent.columns else None,
+                    "ip_proj": None,
+                    "ERA_p10": None,
+                    "ERA_p50": None,
+                    "ERA_p90": None,
+                    "OPS_allowed_p10": None,
+                    "OPS_allowed_p50": None,
+                    "OPS_allowed_p90": None,
+                    "WHIP_p10": None,
+                    "WHIP_p50": None,
+                    "WHIP_p90": None,
+                    "KBB_p10": None,
+                    "KBB_p50": None,
+                    "KBB_p90": None,
+                }
+            )
+            continue
+
+        # Regress each rate to league mean.
+        k_ip_v = float(max(1.0, k_ip))
+        era_tt = estimate_true_talent_rate(float(era_recent), float(ip_recent), float(lg.era), k_ip_v)
+        ops_tt = estimate_true_talent_rate(float(ops_recent) if ops_recent is not None else float(lg.ops_allowed), float(ip_recent), float(lg.ops_allowed), k_ip_v)
+        whip_tt = estimate_true_talent_rate(float(whip_recent) if whip_recent is not None else float(lg.whip), float(ip_recent), float(lg.whip), k_ip_v)
+
+        k_per_ip_tt = estimate_true_talent_rate(
+            float(k_per_ip_recent) if k_per_ip_recent is not None else float(lg.k_per_ip),
+            float(ip_recent),
+            float(lg.k_per_ip),
+            k_ip_v,
+        )
+        bb_per_ip_tt = estimate_true_talent_rate(
+            float(bb_per_ip_recent) if bb_per_ip_recent is not None else float(lg.bb_per_ip),
+            float(ip_recent),
+            float(lg.bb_per_ip),
+            k_ip_v,
+        )
+
+        # IP projection: use last season IP as baseline, with starter boost.
+        ip_last = float(recent.iloc[0]["ip"]) if recent.iloc[0]["ip"] is not None else float(ip_recent / 3.0)
+        gs_last = int(recent.iloc[0]["gs"]) if "gs" in recent.columns and recent.iloc[0]["gs"] is not None else 0
+        is_sp = gs_last >= 10
+
+        # Basic: SP get a higher cap.
+        if is_sp:
+            ip_proj = float(np.clip(ip_last, 60.0, 230.0))
+        else:
+            ip_proj = float(np.clip(ip_last, 20.0, 120.0))
+
+        # Uncertainty: more IP reduces noise.
+        ip_eff = float(max(10.0, ip_recent))
+        era_sigma = float(np.clip(0.85 * math.sqrt(80.0 / (ip_eff + 40.0)), 0.25, 1.20))
+        ops_sigma = float(np.clip(0.080 * math.sqrt(80.0 / (ip_eff + 40.0)), 0.020, 0.110))
+        whip_sigma = float(np.clip(0.18 * math.sqrt(80.0 / (ip_eff + 40.0)), 0.05, 0.30))
+
+        sims_out = simulate_pitching(
+            rng=rng,
+            sims=int(sims),
+            era_mu=float(era_tt),
+            ops_mu=float(ops_tt),
+            whip_mu=float(whip_tt),
+            k_per_ip_mu=float(k_per_ip_tt),
+            bb_per_ip_mu=float(bb_per_ip_tt),
+            ip_proj=float(ip_proj),
+            era_sigma=float(era_sigma),
+            ops_sigma=float(ops_sigma),
+            whip_sigma=float(whip_sigma),
+        )
+
+        ERA_p10, ERA_p50, ERA_p90 = np.percentile(sims_out["ERA"], [10, 50, 90]).tolist()
+        OPS_p10, OPS_p50, OPS_p90 = np.percentile(sims_out["OPS_allowed"], [10, 50, 90]).tolist()
+        WHIP_p10, WHIP_p50, WHIP_p90 = np.percentile(sims_out["WHIP"], [10, 50, 90]).tolist()
+
+        # K/BB ratio distribution
+        k = sims_out["K"].astype(float)
+        bb = sims_out["BB"].astype(float)
+        kbb = np.where(bb <= 0, 99.0, np.clip(k / bb, 0.0, 99.0))
+        KBB_p10, KBB_p50, KBB_p90 = np.percentile(kbb, [10, 50, 90]).tolist()
+
+        out_rows.append(
+            {
+                "player_id": int(pid),
+                "name": name,
+                "target_year": int(target_year),
+                "team": team,
+                "is_sp": bool(is_sp),
+                "gs_last": int(gs_last),
+                "ip_recent": float(ip_recent),
+                "ip_proj": float(ip_proj),
+                "era_recent3": float(era_recent),
+                "ops_allowed_recent3": float(ops_recent) if ops_recent is not None else None,
+                "whip_recent3": float(whip_recent) if whip_recent is not None else None,
+                "ERA_p10": float(ERA_p10),
+                "ERA_p50": float(ERA_p50),
+                "ERA_p90": float(ERA_p90),
+                "OPS_allowed_p10": float(OPS_p10),
+                "OPS_allowed_p50": float(OPS_p50),
+                "OPS_allowed_p90": float(OPS_p90),
+                "WHIP_p10": float(WHIP_p10),
+                "WHIP_p50": float(WHIP_p50),
+                "WHIP_p90": float(WHIP_p90),
+                "KBB_p10": float(KBB_p10),
+                "KBB_p50": float(KBB_p50),
+                "KBB_p90": float(KBB_p90),
+                "sims": int(sims),
+                "k_ip": float(k_ip_v),
+            }
+        )
+
+    df = pd.DataFrame(out_rows)
+
+    preferred = [
+        "player_id",
+        "name",
+        "target_year",
+        "team",
+        "is_sp",
+        "gs_last",
+        "ip_recent",
+        "ip_proj",
+        "era_recent3",
+        "ops_allowed_recent3",
+        "whip_recent3",
+        "ERA_p10",
+        "ERA_p50",
+        "ERA_p90",
+        "OPS_allowed_p10",
+        "OPS_allowed_p50",
+        "OPS_allowed_p90",
+        "WHIP_p10",
+        "WHIP_p50",
+        "WHIP_p90",
+        "KBB_p10",
+        "KBB_p50",
+        "KBB_p90",
+    ]
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    df = df[cols]
+
+    for c in [
+        "ip_recent",
+        "ip_proj",
+        "era_recent3",
+        "ops_allowed_recent3",
+        "whip_recent3",
+        "ERA_p10",
+        "ERA_p50",
+        "ERA_p90",
+        "OPS_allowed_p10",
+        "OPS_allowed_p50",
+        "OPS_allowed_p90",
+        "WHIP_p10",
+        "WHIP_p50",
+        "WHIP_p90",
+        "KBB_p10",
+        "KBB_p50",
+        "KBB_p90",
+    ]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").round(3)
+
+    return df, lg
 def league_context_recent(conn: sqlite3.Connection, recent_years: int = 3) -> LeagueContext:
     try:
         max_year = conn.execute("SELECT MAX(season_year) AS y FROM player_season_batting").fetchone()
@@ -277,6 +658,56 @@ def estimate_true_talent_ops(ops_recent: float, ab_recent: float, lg_ops: float,
     ab_recent = max(0.0, float(ab_recent))
     k_ab = max(1.0, float(k_ab))
     return float((ops_recent * ab_recent + lg_ops * k_ab) / (ab_recent + k_ab))
+
+
+def age_curve_multiplier(
+    age: Optional[int],
+    *,
+    # Typical hitter aging: rise into late 20s, plateau, then decline.
+    peak_start: int = 27,
+    peak_end: int = 29,
+    decline_start: int = 31,
+    # Slope controls (per-year) outside plateau.
+    pre_peak_gain: float = 0.010,
+    post_decline_loss: float = 0.007,
+    # Clamp overall effect so we don't do anything crazy.
+    min_mult: float = 0.85,
+    max_mult: float = 1.15,
+    # "Star" override knobs. If a hitter is far above league, we assume a longer peak
+    # and gentler decline.
+    star: bool = False,
+) -> float:
+    """Return a multiplicative adjustment to apply to rate stats (OPS-ish / HR rate).
+
+    This is intentionally simple and stable:
+    - Ages [peak_start..peak_end] => multiplier ~ 1.0
+    - Before peak_start => linear gain into peak (pre_peak_gain per year)
+    - After decline_start => linear decline (post_decline_loss per year)
+
+    If star=True, we extend peak_end and soften decline.
+    """
+    if age is None:
+        return 1.0
+
+    a = int(age)
+
+    if star:
+        peak_end = max(peak_end, 31)
+        decline_start = max(decline_start, 33)
+        pre_peak_gain *= 0.80
+        post_decline_loss *= 0.60
+
+    if a < peak_start:
+        mult = 1.0 - (peak_start - a) * float(pre_peak_gain)
+    elif peak_start <= a <= peak_end:
+        mult = 1.0
+    elif peak_end < a < decline_start:
+        # extended plateau / gentle fade until decline_start
+        mult = 1.0 - (a - peak_end) * float(post_decline_loss) * 0.25
+    else:
+        mult = 1.0 - (a - decline_start) * float(post_decline_loss)
+
+    return float(np.clip(mult, float(min_mult), float(max_mult)))
 
 
 def gb_effect_multiplier(gb_pct: Optional[float]) -> float:
@@ -597,6 +1028,40 @@ def project_players(
             iso_last = None
             iso_recent3 = None
 
+        # -----------------------------
+        # Age handling
+        # -----------------------------
+        # Prefer the season-level age from the most recent season we have for the player,
+        # then advance it by (target_year - last_season_year).
+        # This makes ages move forward correctly when projecting multiple future seasons.
+        age: Optional[int] = None
+        last_season_year: Optional[int] = None
+        age_last_season: Optional[int] = None
+        try:
+            cols_ps_age = _table_columns(conn, "player_season_batting")
+            if "age" in cols_ps_age:
+                r_age = conn.execute(
+                    """
+                    SELECT season_year, age
+                    FROM player_season_batting
+                    WHERE player_id=?
+                    ORDER BY season_year DESC
+                    LIMIT 1
+                    """,
+                    (int(pid),),
+                ).fetchone()
+                if r_age and r_age["season_year"] is not None:
+                    last_season_year = int(r_age["season_year"])
+                    age_last_season = int(r_age["age"]) if r_age["age"] is not None else None
+        except sqlite3.OperationalError:
+            pass
+
+        if age_last_season is not None and last_season_year is not None:
+            age = int(age_last_season + (int(target_year) - int(last_season_year)))
+        else:
+            # Fallback: parse the player page text. This is less reliable because it may be
+            # the "current" age on the site (not season-anchored), but it's better than None.
+            age = _parse_age_text(prow["birth_or_age_text"]) if prow else None
 
         if ops_recent3 is None or ab_recent is None:
             out_rows.append(
@@ -651,6 +1116,19 @@ def project_players(
         if stadium is None and team_for_park:
             stadium = resolve_stadium_for_team_year(conn, team_for_park, int(target_year))
 
+        # Destination overrides (FA signing scenario)
+        team_for_park = override_team or (team_full or team_raw)
+
+        # Stadium resolution:
+        # - team_for_park is often an abbrev like "SF" (from season batting)
+        # - team_stadiums.team should also be an abbrev, but in case a DB has full names,
+        #   try both forms.
+        if override_stadium:
+            stadium = override_stadium
+        else:
+            stadium = resolve_stadium_for_team_year(conn, team_for_park, int(target_year))
+            if stadium is None and team_full and team_full != team_for_park:
+                stadium = resolve_stadium_for_team_year(conn, team_full, int(target_year))
 
         pf_year = int(target_year) - 1
         pf_year_used, home_idx, away_idx = get_park_pf_ops_for_team_year(conn, team_for_park, pf_year)
@@ -662,6 +1140,15 @@ def project_players(
             lg_ops=float(lg.ops),
             k_ab=float(k_ab_v),
         )
+        # -----------------------------
+        # Age curve adjustment (affects projections)
+        # -----------------------------
+        # "Star" heuristic: if a player's regressed OPS talent is well above league, assume
+        # a longer peak and slower decline.
+        star = ops_tt_prepark >= float(lg.ops) + 0.100
+        age_mult = age_curve_multiplier(age, star=bool(star))
+        ops_tt_prepark *= float(age_mult)
+
         ops_tt_prepark *= (gb_effect_multiplier(gb_pct) ** 0.6)
 
         ab_last = float(recent.iloc[0]["ab"]) if not recent.empty else float(ab_recent / 3.0)
@@ -684,6 +1171,9 @@ def project_players(
             # 6% of the gap closes per forward year (tunable)
             shrink = min(0.40, 0.06 * fwd)
             hr_rate_adj = float((1.0 - shrink) * hr_rate_adj + shrink * float(lg.hr_per_ab))
+        hr_rate_adj = estimate_hr_rate(recent, lg_hr_per_ab=float(lg.hr_per_ab), k_ab=float(k_ab_v), gb_pct=gb_pct)
+        # Apply the same age curve to HR rate. Clamp to avoid extreme aging artifacts.
+        hr_rate_adj = float(np.clip(hr_rate_adj * age_mult, 0.001, 0.200))
 
         if hr_rate_adj is None:
             hr_rate_adj = float(lg.hr_per_ab)
