@@ -179,6 +179,9 @@ class PitchingLeagueContext:
     ops_allowed: float
     k_per_ip: float
     bb_per_ip: float
+    hr_per_ip: float
+    fip_const: float
+
 
 
 def pitching_league_context_recent(conn: sqlite3.Connection, recent_years: int = 3) -> PitchingLeagueContext:
@@ -216,7 +219,36 @@ def pitching_league_context_recent(conn: sqlite3.Connection, recent_years: int =
     k_per_ip = float(r["k_per_ip"]) if r and r["k_per_ip"] is not None else 0.90
     bb_per_ip = float(r["bb_per_ip"]) if r and r["bb_per_ip"] is not None else 0.33
 
-    return PitchingLeagueContext(era=era, whip=whip, ops_allowed=ops_allowed, k_per_ip=k_per_ip, bb_per_ip=bb_per_ip)
+    hr_rows = conn.execute(
+    """
+    select sum(hr) as hr, sum(ip) as ip
+    from player_splits_pitching
+    where split_group = 'platoon'
+    """
+    ).fetchone()
+    lg_hr = float(hr_rows["hr"] or 0.0)
+    lg_ip_hr = float(hr_rows["ip"] or 0.0)
+    hr_per_ip = lg_hr / max(1e-9, lg_ip_hr)
+
+    # You likely already have lg_ip, lg_k, lg_bb from seasons; if not, compute them:
+    tot = conn.execute(
+        """
+        select sum(ip) as ip, sum(k) as k, sum(bb) as bb
+        from player_season_pitching
+        """
+    ).fetchone()
+    lg_ip = float(tot["ip"] or 0.0)
+    lg_k  = float(tot["k"] or 0.0)
+    lg_bb = float(tot["bb"] or 0.0)
+
+    # Estimate lg_hr using hr_per_ip * lg_ip
+    lg_hr_est = hr_per_ip * lg_ip
+
+    fip_const = float(era) - (13.0 * lg_hr_est + 3.0 * lg_bb - 2.0 * lg_k) / max(1e-9, lg_ip)
+
+
+
+    return PitchingLeagueContext(era=era, whip=whip, ops_allowed=ops_allowed, k_per_ip=k_per_ip, bb_per_ip=bb_per_ip, hr_per_ip=hr_per_ip, fip_const=fip_const)
 
 
 def pitcher_recent_seasons(conn: sqlite3.Connection, player_id: int, n: int = 3) -> pd.DataFrame:
@@ -423,6 +455,26 @@ def project_pitchers(
             float(lg.bb_per_ip),
             k_ip_v,
         )
+
+                # --- HR/IP estimate for FIP (from platoon splits) ---
+        hr_per_ip_recent = None
+        try:
+            split_df = pitcher_splits_pitching(conn, int(pid), split_group="platoon")
+            if split_df is not None and len(split_df) > 0:
+                ip_split = float(split_df["ip"].fillna(0.0).sum())
+                hr_split = float(split_df["hr"].fillna(0.0).sum())
+                if ip_split > 1e-9:
+                    hr_per_ip_recent = hr_split / ip_split
+        except Exception:
+            hr_per_ip_recent = None
+
+        hr_per_ip_tt = estimate_true_talent_rate(
+            float(hr_per_ip_recent) if hr_per_ip_recent is not None else float(lg.hr_per_ip),
+            float(ip_recent),
+            float(lg.hr_per_ip),
+            k_ip_v,
+        )
+
 
         # IP projection: use last season IP as baseline, with starter boost.
         ip_last = float(recent.iloc[0]["ip"]) if recent.iloc[0]["ip"] is not None else float(ip_recent / 3.0)
