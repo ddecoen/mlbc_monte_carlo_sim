@@ -441,6 +441,8 @@ def project_pitchers(
         ops_sigma = float(np.clip(0.080 * math.sqrt(80.0 / (ip_eff + 40.0)), 0.020, 0.110))
         whip_sigma = float(np.clip(0.18 * math.sqrt(80.0 / (ip_eff + 40.0)), 0.05, 0.30))
 
+        
+
         sims_out = simulate_pitching(
             rng=rng,
             sims=int(sims),
@@ -457,6 +459,18 @@ def project_pitchers(
 
         ERA_p10, ERA_p50, ERA_p90 = np.percentile(sims_out["ERA"], [10, 50, 90]).tolist()
         OPS_p10, OPS_p50, OPS_p90 = np.percentile(sims_out["OPS_allowed"], [10, 50, 90]).tolist()
+
+        # FIP(no HBP): derive a HR total from HR/IP and IP proj
+        # FIP = (13*HR + 3*BB - 2*K) / IP + const
+        hr_sim = np.clip(hr_per_ip_tt * float(ip_proj) * (1.0 + 0.18 * rng.standard_normal(size=int(sims))), 0.0, 9999.0)
+        bb_sim = sims_out["BB"].astype(float)
+        k_sim = sims_out["K"].astype(float)
+        ip_sim = float(ip_proj)
+        fip = (13.0 * hr_sim + 3.0 * bb_sim - 2.0 * k_sim) / max(1e-9, ip_sim) + float(lg.fip_const)
+        fip = np.clip(fip, 0.50, 12.00)
+
+        FIP_p10, FIP_p50, FIP_p90 = np.percentile(fip, [10, 50, 90]).tolist()
+
         WHIP_p10, WHIP_p50, WHIP_p90 = np.percentile(sims_out["WHIP"], [10, 50, 90]).tolist()
 
         # K/BB ratio distribution
