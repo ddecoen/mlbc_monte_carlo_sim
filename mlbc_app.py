@@ -382,7 +382,7 @@ if run:
                 except Exception:
                     override_team = None
 
-        if compare_mode and (destination_team or destination_stadium):
+        if mode != "Pitchers" and compare_mode and (destination_team or destination_stadium):
             # Stadium-mode: resolve tenant team for the chosen stadium in target_year and
             # use that team's PF indices as a proxy. Also override displayed stadium.
             override_team = None
@@ -457,10 +457,16 @@ if run:
             df["delta_HR_p10"] = (df["dest_HR_p10"] - df["HR_p10"]).round(2)
             df["delta_HR_p90"] = (df["dest_HR_p90"] - df["HR_p90"]).round(2)
 
-        if mode == "Pitchers" and compare_mode:
-            st.info("Destination park comparison is currently implemented for hitters only.")
-        else:
+                # If we didn't build a destination-compare df, fall back to base.
+        if mode == "Pitchers":
+            if compare_mode:
+                st.info("Destination park comparison is currently implemented for hitters only.")
             df = df_base
+        else:
+            # Hitters: keep df as-is if we built it; otherwise default to base.
+            if not (compare_mode and (destination_team or destination_stadium)):
+                df = df_base
+
 
         conn.close()
 
