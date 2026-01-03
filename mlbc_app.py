@@ -125,6 +125,12 @@ with st.sidebar:
         k_ip = None
     k_ab = st.number_input("Regression prior (k-ab)", min_value=0, max_value=1000, value=150, step=10)
 
+    if mode != "Pitchers":
+        pct_vs_rhp = st.slider("% PA vs RHP (platoon mix)", 0.0, 1.0, 0.70, 0.01, key="pct_vs_rhp",)
+    else:
+        pct_vs_rhp = None
+
+
     st.divider()
     st.subheader("Free Agent / destination park")
     compare_mode = st.checkbox("Compare vs destination park", value=False)
@@ -349,6 +355,7 @@ if run:
                 seed=int(seed),
                 k_ab_prior=int(k_ab),
                 league_years=int(league_years),
+                pct_vs_rhp=float(pct_vs_rhp or 0.70),
             )
 
         if mode != "Pitchers" and compare_mode and (destination_team or destination_stadium):
@@ -430,6 +437,8 @@ if run:
                 league_years=int(league_years),
                 override_team=override_team,
                 override_stadium=override_stadium,
+                pct_vs_rhp=float(pct_vs_rhp or 0.70),
+
             )
 
             # Merge and compute deltas
