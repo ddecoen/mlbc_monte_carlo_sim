@@ -528,11 +528,39 @@ if run:
             cx2.metric("GS last", f"{int(row.get('gs_last', 0))}")
             cx3.metric("Starter?", "SP" if bool(row.get('is_sp', False)) else "RP")
         else:
-            st.markdown(f"### {row['name']} ({int(row['player_id'])}) — {row.get('team','')} @ {row.get('stadium','')}")
+            # Header: include destination context if present
+            header = f"### {row['name']} ({int(row['player_id'])}) — {row.get('team','')} @ {row.get('stadium','')}"
+            if compare_mode and pd.notna(row.get("dest_team")):
+                header += f"  →  {row.get('dest_team','')} @ {row.get('dest_stadium','')}"
+            st.markdown(header)
+
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("OPS p10 / p50 / p90", f"{row['OPS_p10']:.3f} / {row['OPS_p50']:.3f} / {row['OPS_p90']:.3f}")
-            c2.metric("HR p10 / p50 / p90", f"{int(row['HR_p10'])} / {int(row['HR_p50'])} / {int(row['HR_p90'])}")
-            c3.metric("GB%", f"{row.get('gb_pct', 'NA')}")
-            c4.metric("Var mult", f"{row.get('var_mult','NA')}")
+
+            # Base metrics
+            c1.metric(
+                "OPS p10 / p50 / p90",
+                f"{row['OPS_p10']:.3f} / {row['OPS_p50']:.3f} / {row['OPS_p90']:.3f}",
+            )
+            c2.metric(
+                "HR p10 / p50 / p90",
+                f"{int(row['HR_p10'])} / {int(row['HR_p50'])} / {int(row['HR_p90'])}",
+            )
+
+            # Destination metrics (only if compare ran)
+            if compare_mode and pd.notna(row.get("dest_OPS_p50", np.nan)):
+                c3.metric(
+                    "Dest OPS p10 / p50 / p90",
+                    f"{row['dest_OPS_p10']:.3f} / {row['dest_OPS_p50']:.3f} / {row['dest_OPS_p90']:.3f}",
+                    delta=f"{row.get('delta_OPS_p50', 0.0):+.3f}",
+                )
+                c4.metric(
+                    "Dest HR p10 / p50 / p90",
+                    f"{int(row['dest_HR_p10'])} / {int(row['dest_HR_p50'])} / {int(row['dest_HR_p90'])}",
+                    delta=f"{row.get('delta_HR_p50', 0.0):+.2f}",
+                )
+            else:
+                c3.metric("GB%", f"{row.get('gb_pct', 'NA')}")
+                c4.metric("Var mult", f"{row.get('var_mult','NA')}")
+
 
     st.caption("Tip: Change sims/seed to see stability; raise sims for smoother percentiles.")
