@@ -550,10 +550,19 @@ if run:
                 "OPS p10 / p50 / p90",
                 f"{row['OPS_p10']:.3f} / {row['OPS_p50']:.3f} / {row['OPS_p90']:.3f}",
             )
+            def _fmt_int(x):
+                try:
+                    if x is None or (isinstance(x, float) and np.isnan(x)):
+                        return "NA"
+                    return str(int(x))
+                except Exception:
+                    return "NA"
+
             c2.metric(
                 "HR p10 / p50 / p90",
-                f"{int(row['HR_p10'])} / {int(row['HR_p50'])} / {int(row['HR_p90'])}",
+                f"{_fmt_int(row.get('HR_p10'))} / {_fmt_int(row.get('HR_p50'))} / {_fmt_int(row.get('HR_p90'))}",
             )
+
 
             # Destination metrics (only if compare ran)
             if compare_mode and pd.notna(row.get("dest_OPS_p50", np.nan)):
