@@ -135,6 +135,36 @@ CREATE TABLE IF NOT EXISTS player_splits_pitching (
   PRIMARY KEY(player_id, split_group, split_key)
 );
 
+CREATE TABLE IF NOT EXISTS player_edits_hitting (
+  player_id INTEGER PRIMARY KEY,
+
+  perf_ab INTEGER,
+  perf_h INTEGER,
+  perf_2b INTEGER,
+  perf_3b INTEGER,
+  perf_hr INTEGER,
+  perf_bb INTEGER,
+  perf_so INTEGER,
+
+  avg_vs_l REAL,
+  obp_vs_l REAL,
+  slg_vs_l REAL,
+  avg_vs_r REAL,
+  obp_vs_r REAL,
+  slg_vs_r REAL,
+
+  pull_pct REAL,
+  middle_pct REAL,
+  oppo_pct REAL,
+  gb_pct REAL,
+
+  arm_strength REAL,
+  run_speed REAL,
+
+  scraped_ts INTEGER
+);
+
+
 CREATE TABLE IF NOT EXISTS team_roster_players (
   team TEXT NOT NULL,
   player_id INTEGER NOT NULL,
@@ -199,6 +229,15 @@ def _norm_col(c) -> str:
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
+def _re_float(text: str, label: str) -> Optional[float]:
+    m = re.search(rf"{re.escape(label)}\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.I)
+    return _safe_float(m.group(1)) if m else None
+
+def _re_int(text: str, label: str) -> Optional[int]:
+    m = re.search(rf"{re.escape(label)}\s*([0-9]+)", text, flags=re.I)
+    return _safe_int(m.group(1)) if m else None
+
+
 
 def _collapse_text(page_html: str) -> str:
     s = re.sub(r"(?is)<script.*?>.*?</script>", " ", page_html)
@@ -231,6 +270,51 @@ def _safe_float(x) -> Optional[float]:
         return None
 
 
+def upsert_player_edits_hitting(conn: sqlite3.Connection, player_id: int, edits: Dict[str, Optional[float]]) -> None:
+    conn.execute(
+        """
+        INSERT INTO player_edits_hitting(
+          player_id,
+          perf_ab, perf_h, perf_2b, perf_3b, perf_hr, perf_bb, perf_so,
+          avg_vs_l, obp_vs_l, slg_vs_l,
+          avg_vs_r, obp_vs_r, slg_vs_r,
+          pull_pct, middle_pct, oppo_pct, gb_pct,
+          arm_strength, run_speed,
+          scraped_ts
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, strftime('%s','now'))
+        ON CONFLICT(player_id) DO UPDATE SET
+          perf_ab=excluded.perf_ab,
+          perf_h=excluded.perf_h,
+          perf_2b=excluded.perf_2b,
+          perf_3b=excluded.perf_3b,
+          perf_hr=excluded.perf_hr,
+          perf_bb=excluded.perf_bb,
+          perf_so=excluded.perf_so,
+          avg_vs_l=excluded.avg_vs_l,
+          obp_vs_l=excluded.obp_vs_l,
+          slg_vs_l=excluded.slg_vs_l,
+          avg_vs_r=excluded.avg_vs_r,
+          obp_vs_r=excluded.obp_vs_r,
+          slg_vs_r=excluded.slg_vs_r,
+          pull_pct=excluded.pull_pct,
+          middle_pct=excluded.middle_pct,
+          oppo_pct=excluded.oppo_pct,
+          gb_pct=excluded.gb_pct,
+          arm_strength=excluded.arm_strength,
+          run_speed=excluded.run_speed,
+          scraped_ts=excluded.scraped_ts
+        """,
+        (
+            int(player_id),
+            edits.get("perf_ab"), edits.get("perf_h"), edits.get("perf_2b"), edits.get("perf_3b"),
+            edits.get("perf_hr"), edits.get("perf_bb"), edits.get("perf_so"),
+            edits.get("avg_vs_l"), edits.get("obp_vs_l"), edits.get("slg_vs_l"),
+            edits.get("avg_vs_r"), edits.get("obp_vs_r"), edits.get("slg_vs_r"),
+            edits.get("pull_pct"), edits.get("middle_pct"), edits.get("oppo_pct"), edits.get("gb_pct"),
+            edits.get("arm_strength"), edits.get("run_speed"),
+        ),
+    )
 
 
 def _safe_token(x: str) -> Optional[str]:
@@ -710,19 +794,104 @@ def scrape_player_card(fetcher: Fetcher, player_id: int) -> Tuple[Dict[str, Opti
 def scrape_player_edits(fetcher: Fetcher, player_id: int) -> Dict[str, Optional[float]]:
     url = f"{BASE}/pcarde.php?id={player_id}"
     html_page = fetcher.get(url)
+    text = _collapse_text(html_page)
 
-    gb = None
-    try:
-        dfs = _read_html_tables(html_page)
-        gb = _extract_gb_pct_from_tables(dfs)
-    except Exception:
-        gb = None
+    out: Dict[str, Optional[float]] = {}
 
-    if gb is None:
-        text = _collapse_text(html_page)
-        gb = _extract_gb_pct_from_text(text)
+    # -----------------------
+    # Performance Data block
+    # -----------------------
+    # Example:
+    # Performance Data Ab Hits 2b 600 184 37 3b Hr Walks So 1 53 106 70
+    m = re.search(
+        r"Performance Data\s+Ab\s+Hits\s+2b\s+(\d+)\s+(\d+)\s+(\d+)\s+3b\s+Hr\s+Walks\s+So\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)",
+        text,
+        flags=re.I,
+    )
+    if m:
+        out["perf_ab"] = _safe_int(m.group(1))
+        out["perf_h"] = _safe_int(m.group(2))
+        out["perf_2b"] = _safe_int(m.group(3))
+        out["perf_3b"] = _safe_int(m.group(4))
+        out["perf_hr"] = _safe_int(m.group(5))
+        out["perf_bb"] = _safe_int(m.group(6))
+        out["perf_so"] = _safe_int(m.group(7))
+    else:
+        out["perf_ab"] = None
+        out["perf_h"] = None
+        out["perf_2b"] = None
+        out["perf_3b"] = None
+        out["perf_hr"] = None
+        out["perf_bb"] = None
+        out["perf_so"] = None
 
-    return {"gb_pct": gb}
+    # -------------
+    # Averages block
+    # -------------
+    # Example:
+    # Averages AVG vs L OBP vs L SLG vs L 0.299 0.401 0.623 AVG vs R OBP vs R SLG vs R 0.315 0.422 0.655
+    m = re.search(
+        r"Averages\s+AVG vs L\s+OBP vs L\s+SLG vs L\s+([0-9]+\.[0-9]+)\s+([0-9]+\.[0-9]+)\s+([0-9]+\.[0-9]+)\s+"
+        r"AVG vs R\s+OBP vs R\s+SLG vs R\s+([0-9]+\.[0-9]+)\s+([0-9]+\.[0-9]+)\s+([0-9]+\.[0-9]+)",
+        text,
+        flags=re.I,
+    )
+    if m:
+        out["avg_vs_l"] = _safe_float(m.group(1))
+        out["obp_vs_l"] = _safe_float(m.group(2))
+        out["slg_vs_l"] = _safe_float(m.group(3))
+        out["avg_vs_r"] = _safe_float(m.group(4))
+        out["obp_vs_r"] = _safe_float(m.group(5))
+        out["slg_vs_r"] = _safe_float(m.group(6))
+    else:
+        out["avg_vs_l"] = None
+        out["obp_vs_l"] = None
+        out["slg_vs_l"] = None
+        out["avg_vs_r"] = None
+        out["obp_vs_r"] = None
+        out["slg_vs_r"] = None
+
+    # ----------------
+    # Distribution box
+    # ----------------
+    # Example:
+    # Distribution Pull Middle Opp Field GB% 41.2 35.2 23.5 33
+    m = re.search(
+        r"Distribution\s+Pull\s+Middle\s+Opp Field\s+GB%\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)",
+        text,
+        flags=re.I,
+    )
+    if m:
+        out["pull_pct"] = _safe_float(m.group(1))
+        out["middle_pct"] = _safe_float(m.group(2))
+        out["oppo_pct"] = _safe_float(m.group(3))
+        out["gb_pct"] = _safe_float(m.group(4))
+    else:
+        out["pull_pct"] = None
+        out["middle_pct"] = None
+        out["oppo_pct"] = None
+        out["gb_pct"] = None
+
+    # ------------
+    # Tools / misc
+    # ------------
+    # Example:
+    # Arm Strength Run Speed 4.83 2.95
+    m = re.search(
+        r"Arm Strength\s+Run Speed\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)",
+        text,
+        flags=re.I,
+    )
+    if m:
+        out["arm_strength"] = _safe_float(m.group(1))
+        out["run_speed"] = _safe_float(m.group(2))
+    else:
+        out["arm_strength"] = None
+        out["run_speed"] = None
+
+    return out
+
+
 
 
 def scrape_player_card_pitching(fetcher: Fetcher, player_id: int) -> List[Dict]:
@@ -804,22 +973,6 @@ def scrape_player_card_pitching(fetcher: Fetcher, player_id: int) -> List[Dict]:
         )
 
     return seasons
-    url = f"{BASE}/pcarde.php?id={player_id}"
-    html_page = fetcher.get(url)
-
-    gb = None
-    try:
-        dfs = _read_html_tables(html_page)
-        gb = _extract_gb_pct_from_tables(dfs)
-    except Exception:
-        gb = None
-
-    if gb is None:
-        text = _collapse_text(html_page)
-        gb = _extract_gb_pct_from_text(text)
-
-    return {"gb_pct": gb}
-
 
 def scrape_player_splits(fetcher: Fetcher, player_id: int) -> List[Dict]:
     url = f"{BASE}/pcardsplit.php?id={player_id}"
@@ -1412,6 +1565,7 @@ def ingest_players(
     do_splits_batting: bool,
     do_pitching: bool,
     do_splits_pitching: bool,
+    do_edits: bool, 
 ) -> None:
     for pid in player_ids:
         try:
@@ -1419,6 +1573,10 @@ def ingest_players(
             edits = scrape_player_edits(fetcher, pid)
             upsert_player(conn, pid, fields, edits.get("gb_pct"))
 
+            if do_edits:
+                upsert_player_edits_hitting(conn, pid, edits)
+
+            
             if seasons_bat:
                 replace_player_seasons(conn, seasons_bat)
 
@@ -1462,6 +1620,7 @@ def ingest_all(
     do_splits_batting: bool,
     do_pitching: bool,
     do_splits_pitching: bool,
+    do_edits: bool,
     limit: Optional[int],
     start_at: int,
 ) -> None:
@@ -1478,6 +1637,7 @@ def ingest_all(
         do_splits_batting=do_splits_batting,
         do_pitching=do_pitching,
         do_splits_pitching=do_splits_pitching,
+        do_edits=do_edits,
     )
 
 
@@ -1509,6 +1669,9 @@ def main() -> None:
     ap.add_argument("--splits", action="store_true", help="Scrape batting splits")
     ap.add_argument("--pitching", action="store_true", help="Scrape pitching season stats")
     ap.add_argument("--pitching-splits", action="store_true", help="Scrape pitching splits (platoon + situational)")
+
+    ap.add_argument("--edits", action="store_true", help="Scrape pcarde.php edits/ratings for hitters (rookies/minors)")
+
 
     ap.add_argument("--stadiums", action="store_true")
 
@@ -1604,7 +1767,7 @@ def main() -> None:
             if args.discover_id_sleep:
                 time.sleep(float(args.discover_id_sleep))
 
-    print(f"[discover-id-range] checked={checked} found={found}", flush=True)
+        print(f"[discover-id-range] checked={checked} found={found}", flush=True)
 
 
 
@@ -1633,6 +1796,7 @@ def main() -> None:
             do_splits_batting=args.splits,
             do_pitching=args.pitching,
             do_splits_pitching=args.pitching_splits,
+            do_edits=args.edits,
         )
 
     if args.ingest_all:
@@ -1642,6 +1806,7 @@ def main() -> None:
             do_splits_batting=args.splits,
             do_pitching=args.pitching,
             do_splits_pitching=args.pitching_splits,
+            do_edits=args.edits,
             limit=args.limit,
             start_at=args.start_at,
         )
