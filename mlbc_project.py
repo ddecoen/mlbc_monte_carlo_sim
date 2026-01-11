@@ -84,6 +84,36 @@ def _parse_age_text(birth_or_age_text: Any) -> Optional[int]:
             return age
     return None
 
+def batter_platoon_splits(conn, player_id: int) -> dict:
+    """
+    Returns platoon split stats from player_splits_batting (single-season snapshot).
+    Keys: 'vs RH Pitchers', 'vs LH Pitchers'
+    Values: {'ab': float, 'ops': float}
+    """
+    try:
+        df = pd.read_sql_query(
+            """
+            select split_key, ab, ops
+            from player_splits_batting
+            where player_id = ?
+              and split_key in ('vs RH Pitchers', 'vs LH Pitchers')
+            """,
+            conn,
+            params=(int(player_id),),
+        )
+    except Exception:
+        return {}
+
+    out: dict = {}
+    for _, r in df.iterrows():
+        k = str(r["split_key"])
+        out[k] = {
+            "ab": float(r["ab"] if r["ab"] is not None else 0.0),
+            "ops": float(r["ops"] if r["ops"] is not None else 0.0),
+        }
+    return out
+
+
 
 # -----------------------------
 # Team + stadium resolution
@@ -929,6 +959,190 @@ def simulate_ops_hr(
     return ops_sim, hr_sim
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        r = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (table,),
+        ).fetchone()
+        return bool(r)
+    except Exception:
+        return False
+
+def _zscore_fit(df: pd.DataFrame, cols: list[str]) -> tuple[pd.Series, pd.Series]:
+    mu = df[cols].mean(axis=0)
+    sd = df[cols].std(axis=0).replace(0.0, 1.0)
+    return mu, sd
+
+def _zscore_apply(df: pd.DataFrame, cols: list[str], mu: pd.Series, sd: pd.Series) -> pd.DataFrame:
+    return (df[cols] - mu) / sd
+
+def load_edits_training_set(conn: sqlite3.Connection, *, min_ab: int = 150) -> pd.DataFrame:
+    """
+    Training rows: players with edits + at least one MLB season with AB >= min_ab.
+    Labels:
+      - ops_recent3 (AB-weighted over last 3 seasons)
+      - hr_per_ab_recent3 (recency-weighted over last 3 seasons)
+    """
+    if not _table_exists(conn, "player_edits_hitting"):
+        return pd.DataFrame()
+
+    train = pd.read_sql_query(
+        """
+        select
+          e.player_id,
+          e.perf_ab, e.perf_h, e.perf_2b, e.perf_3b, e.perf_hr, e.perf_bb, e.perf_so,
+          e.avg_vs_l, e.obp_vs_l, e.slg_vs_l,
+          e.avg_vs_r, e.obp_vs_r, e.slg_vs_r,
+          e.pull_pct, e.middle_pct, e.oppo_pct, e.gb_pct,
+          e.arm_strength, e.run_speed
+        from player_edits_hitting e
+        where exists (
+          select 1
+          from player_season_batting b
+          where b.player_id = e.player_id
+            and b.ab >= ?
+        )
+        """,
+        conn,
+        params=(int(min_ab),),
+    )
+    if train.empty:
+        return train
+
+    labels = []
+    for pid in train["player_id"].astype(int).tolist():
+        recent = player_recent_seasons(conn, int(pid), n=3)
+        ops_recent3, ab_recent = weighted_recent_ops(recent)
+        hr_rate_recent, ab_hr_recent = weighted_recent_hr_per_ab(recent)
+
+        labels.append(
+            {
+                "player_id": int(pid),
+                "ops_recent3": ops_recent3,
+                "ab_recent3": ab_recent,
+                "hr_per_ab_recent3": hr_rate_recent,
+                "ab_hr_recent3": ab_hr_recent,
+            }
+        )
+
+    lab = pd.DataFrame(labels)
+    out = train.merge(lab, on="player_id", how="left")
+    out = out[(out["ops_recent3"].notna()) & (out["hr_per_ab_recent3"].notna())].copy()
+    return out
+
+def predict_from_edits_knn(
+    conn: sqlite3.Connection,
+    *,
+    player_id: int,
+    age: Optional[int],
+    k: int = 30,
+    min_ab: int = 150,
+) -> tuple[Optional[float], Optional[float], int]:
+    """
+    Returns (ops_est, hr_per_ab_est, n_used).
+    """
+    if not _table_exists(conn, "player_edits_hitting"):
+        return None, None, 0
+
+    tgt = pd.read_sql_query(
+        """
+        select
+          player_id,
+          perf_ab, perf_h, perf_2b, perf_3b, perf_hr, perf_bb, perf_so,
+          avg_vs_l, obp_vs_l, slg_vs_l,
+          avg_vs_r, obp_vs_r, slg_vs_r,
+          pull_pct, middle_pct, oppo_pct, gb_pct,
+          arm_strength, run_speed
+        from player_edits_hitting
+        where player_id = ?
+        """,
+        conn,
+        params=(int(player_id),),
+    )
+    if tgt.empty:
+        return None, None, 0
+
+    train = load_edits_training_set(conn, min_ab=int(min_ab))
+    if train.empty:
+        return None, None, 0
+
+    feat_cols = [
+        "perf_ab", "perf_h", "perf_2b", "perf_3b", "perf_hr", "perf_bb", "perf_so",
+        "avg_vs_l", "obp_vs_l", "slg_vs_l",
+        "avg_vs_r", "obp_vs_r", "slg_vs_r",
+        "pull_pct", "middle_pct", "oppo_pct", "gb_pct",
+        "arm_strength", "run_speed",
+    ]
+
+    # Include age as a feature (rookies benefit; training ages not yet available -> median-filled)
+    train = train.copy()
+    tgt = tgt.copy()
+    train["age_feat"] = np.nan
+    tgt["age_feat"] = float(age) if age is not None else np.nan
+    feat_cols2 = feat_cols + ["age_feat"]
+
+    # Compute medians; drop feature columns with no signal (median NaN)
+    med = train[feat_cols2].median(axis=0, numeric_only=True)
+    feat_cols2 = [c for c in feat_cols2 if c in med.index and pd.notna(med[c])]
+    if len(feat_cols2) < 5:
+        return None, None, 0
+
+    # Fill NaNs with column medians (restricted to usable columns)
+    med = train[feat_cols2].median(axis=0, numeric_only=True)
+    train[feat_cols2] = train[feat_cols2].fillna(med)
+    tgt[feat_cols2] = tgt[feat_cols2].fillna(med)
+
+    # Force numeric dtypes (prevents object-dtype issues)
+    train[feat_cols2] = train[feat_cols2].apply(pd.to_numeric, errors="coerce")
+    tgt[feat_cols2] = tgt[feat_cols2].apply(pd.to_numeric, errors="coerce")
+
+    # Re-fill any NaNs introduced by coercion
+    med = train[feat_cols2].median(axis=0, numeric_only=True)
+    train[feat_cols2] = train[feat_cols2].fillna(med)
+    tgt[feat_cols2] = tgt[feat_cols2].fillna(med)
+
+    # Final guard: if still NaNs, bail out
+    if train[feat_cols2].isna().any().any() or tgt[feat_cols2].isna().any().any():
+        return None, None, 0
+
+    # Force numeric dtypes (prevents object-dtype fillna/NaN issues)
+    train[feat_cols2] = train[feat_cols2].apply(pd.to_numeric, errors="coerce")
+    tgt[feat_cols2] = tgt[feat_cols2].apply(pd.to_numeric, errors="coerce")
+
+    # Re-fill any NaNs introduced by coercion
+    med = train[feat_cols2].median(axis=0, numeric_only=True)
+    train[feat_cols2] = train[feat_cols2].fillna(med)
+    tgt[feat_cols2] = tgt[feat_cols2].fillna(med)
+
+
+
+    # Standardize
+    mu, sd = _zscore_fit(train, feat_cols2)
+    X = _zscore_apply(train, feat_cols2, mu, sd).to_numpy(dtype=float)
+    x0 = _zscore_apply(tgt, feat_cols2, mu, sd).to_numpy(dtype=float)[0]
+
+    d = np.sqrt(((X - x0) ** 2).sum(axis=1))
+    k_eff = int(min(max(5, k), len(train)))
+    idx = np.argsort(d)[:k_eff]
+    d_sel = d[idx]
+    w = 1.0 / (d_sel + 1e-6)
+
+    ops_vals = train.iloc[idx]["ops_recent3"].to_numpy(dtype=float)
+    hr_vals = train.iloc[idx]["hr_per_ab_recent3"].to_numpy(dtype=float)
+
+    ops_est = float(np.average(ops_vals, weights=w))
+    hr_est = float(np.average(hr_vals, weights=w))
+
+    if not np.isfinite(ops_est):
+        return None, None, 0
+    if not np.isfinite(hr_est):
+        hr_est = None
+
+    return ops_est, hr_est, int(k_eff)
+
+
+
 # -----------------------------
 # Backward-compatible arg mapping
 # -----------------------------
@@ -1021,6 +1235,10 @@ def project_players(
     home_game_share = float(legacy_kwargs.pop("home_game_share", 0.5) or 0.5)
     home_game_share = float(np.clip(home_game_share, 0.0, 1.0))
 
+    pct_vs_rhp = float(legacy_kwargs.pop("pct_vs_rhp", 0.70) or 0.70)
+    pct_vs_rhp = float(np.clip(pct_vs_rhp, 0.0, 1.0))
+
+
     players_list = [int(x) for x in players]
     rng = np.random.default_rng(int(seed_v))
     lg = league_context_recent(conn, recent_years=lg_years_v)
@@ -1073,6 +1291,21 @@ def project_players(
 
         recent = player_recent_seasons(conn, int(pid), n=3)
         ops_recent3, ab_recent = weighted_recent_ops(recent)
+
+        # Rookie / small-sample detection (league rule): max season AB < 150
+        max_ab = 0
+        try:
+            if recent is not None and not recent.empty and "ab" in recent.columns:
+                max_ab = int(recent["ab"].fillna(0).max())
+        except Exception:
+            max_ab = 0
+
+        is_rookie_ab150 = max_ab < 150
+        ops_source = "mlb_recent3"
+        ops_edits_knn = None
+        hr_edits_knn = None
+        knn_n_used = 0
+
 
         # ISO context (not projected): last-season and recent-3 (AB-weighted)
         iso_last = None
@@ -1129,34 +1362,50 @@ def project_players(
             # the "current" age on the site (not season-anchored), but it's better than None.
             age = _parse_age_text(prow["birth_or_age_text"]) if prow else None
 
-        if ops_recent3 is None or ab_recent is None:
-            out_rows.append(
-                dict(
-                    player_id=int(pid),
-                    name=name,
-                    target_year=int(target_year),
-                    team=None,
-                    stadium=None,
-                    age=age,
-                    ab_proj=None,
-                    gb_pct=gb_pct,
-                    ISO_last=iso_last,
-                    ISO_recent3=iso_recent3,
-                    park_pf_year=None,
-                    park_pf_home_idx=100.0,
-                    park_pf_away_idx=100.0,
-                    ops_recent3=None,
-                    ops_true_talent_prepark=None,
-                    OPS_p10=None,
-                    OPS_p50=None,
-                    OPS_p90=None,
-                    HR_p10=None,
-                    HR_p50=None,
-                    HR_p90=None,
-                    park_mult=1.0,
+        # If we have no MLB seasons, try edits-based kNN (rookies/minors).
+        if (ops_recent3 is None or ab_recent is None) or is_rookie_ab150:
+            ops_est, hr_est, n_used = predict_from_edits_knn(conn, player_id=int(pid), age=age, k=30, min_ab=150)
+            if ops_est is not None and np.isfinite(ops_est):
+                ops_recent3 = float(ops_est)
+                ab_recent = 150.0
+                ops_source = "edits_knn"
+                ops_edits_knn = float(ops_est)
+                knn_n_used = int(n_used)
+                if hr_est is not None and np.isfinite(hr_est):
+                    hr_edits_knn = float(hr_est)
+            else:
+                out_rows.append(
+                    dict(
+                        player_id=int(pid),
+                        name=name,
+                        target_year=int(target_year),
+                        team=None,
+                        stadium=None,
+                        age=age,
+                        ab_proj=None,
+                        gb_pct=gb_pct,
+                        park_pf_year=None,
+                        park_pf_home_idx=100.0,
+                        park_pf_away_idx=100.0,
+                        ops_recent3=None,
+                        ops_true_talent_prepark=None,
+                        OPS_p10=None,
+                        OPS_p50=None,
+                        OPS_p90=None,
+                        HR_p10=None,
+                        HR_p50=None,
+                        HR_p90=None,
+                        park_mult=1.0,
+                        max_ab_season=int(max_ab),
+                        is_rookie_ab150=bool(is_rookie_ab150),
+                        ops_source=str(ops_source),
+                        ops_edits_knn=ops_edits_knn,
+                        hr_per_ab_edits_knn=hr_edits_knn,
+                        knn_n_used=int(knn_n_used),
+                    )
                 )
-            )
-            continue
+                continue
+
 
         team_raw = None
         cols_ps = _table_columns(conn, "player_season_batting")
@@ -1217,6 +1466,43 @@ def project_players(
 
         ops_tt_prepark *= (gb_effect_multiplier(gb_pct) ** 0.6)
 
+        # -----------------------------
+        # Platoon-aware OPS (vs RHP / vs LHP), combined by pct_vs_rhp
+        # Uses player_splits_batting snapshot split keys:
+        #   'vs RH Pitchers', 'vs LH Pitchers'
+        # -----------------------------
+        platoon = batter_platoon_splits(conn, int(pid))
+        vs_r = platoon.get("vs RH Pitchers")
+        vs_l = platoon.get("vs LH Pitchers")
+
+        ops_tt_vs_rhp = None
+        ops_tt_vs_lhp = None
+        ops_vs_rhp_split = None
+        ops_vs_lhp_split = None
+
+        if vs_r and float(vs_r.get("ab", 0.0)) > 0:
+            ops_vs_rhp_split = float(vs_r.get("ops", 0.0))
+            ops_tt_vs_rhp = estimate_true_talent_ops(
+                ops_recent=float(ops_vs_rhp_split),
+                ab_recent=float(vs_r.get("ab", 0.0)),
+                lg_ops=float(lg.ops),
+                k_ab=float(k_ab_v),
+            )
+
+        if vs_l and float(vs_l.get("ab", 0.0)) > 0:
+            ops_vs_lhp_split = float(vs_l.get("ops", 0.0))
+            ops_tt_vs_lhp = estimate_true_talent_ops(
+                ops_recent=float(ops_vs_lhp_split),
+                ab_recent=float(vs_l.get("ab", 0.0)),
+                lg_ops=float(lg.ops),
+                k_ab=float(k_ab_v),
+            )
+
+        # If we have both platoon talents, combine them; otherwise keep existing ops_tt_prepark
+        if ops_tt_vs_rhp is not None and ops_tt_vs_lhp is not None:
+            ops_tt_prepark = float(pct_vs_rhp) * float(ops_tt_vs_rhp) + (1.0 - float(pct_vs_rhp)) * float(ops_tt_vs_lhp)
+
+
         ab_last = float(recent.iloc[0]["ab"]) if not recent.empty else float(ab_recent / 3.0)
         ab_proj = int(np.clip(ab_last, 250, 700))
 
@@ -1237,7 +1523,16 @@ def project_players(
             # 6% of the gap closes per forward year (tunable)
             shrink = min(0.40, 0.06 * fwd)
             hr_rate_adj = float((1.0 - shrink) * hr_rate_adj + shrink * float(lg.hr_per_ab))
-        hr_rate_adj = estimate_hr_rate(recent, lg_hr_per_ab=float(lg.hr_per_ab), k_ab=float(k_ab_v), gb_pct=gb_pct)
+            if hr_edits_knn is not None:
+                hr_rate_recent = float(hr_edits_knn)
+                ab_hr_recent = 150.0
+                hr_rate_adj = float(
+                    (hr_rate_recent * ab_hr_recent + float(lg.hr_per_ab) * float(k_ab_v)) / (ab_hr_recent + float(k_ab_v))
+                )
+                hr_rate_adj *= (gb_effect_multiplier(gb_pct) ** 0.6)
+            else:
+                hr_rate_adj = estimate_hr_rate(recent, lg_hr_per_ab=float(lg.hr_per_ab), k_ab=float(k_ab_v), gb_pct=gb_pct)
+
         # Apply the same age curve to HR rate. Clamp to avoid extreme aging artifacts.
         hr_rate_adj = float(np.clip(hr_rate_adj * age_mult, 0.001, 0.200))
 
@@ -1296,6 +1591,19 @@ def project_players(
                 sims=int(sims_v),
                 k_ab=int(k_ab_v),
                 hr_dispersion=float(hr_disp_v),
+                pct_vs_rhp=float(pct_vs_rhp),
+                ops_vs_rhp_split=ops_vs_rhp_split,
+                ops_vs_lhp_split=ops_vs_lhp_split,
+                ops_tt_vs_rhp_prepark=float(ops_tt_vs_rhp) if ops_tt_vs_rhp is not None else None,
+                ops_tt_vs_lhp_prepark=float(ops_tt_vs_lhp) if ops_tt_vs_lhp is not None else None,
+                max_ab_season=int(max_ab),
+                is_rookie_ab150=bool(is_rookie_ab150),
+                ops_source=str(ops_source),
+                ops_edits_knn=ops_edits_knn,
+                hr_per_ab_edits_knn=hr_edits_knn,
+                knn_n_used=int(knn_n_used),
+
+
             )
         )
 
