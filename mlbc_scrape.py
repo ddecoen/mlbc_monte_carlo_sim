@@ -1502,6 +1502,10 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=25.0)
 
     ap.add_argument("--players", nargs="*", type=int, default=[])
+    ap.add_argument("--player-id-range", nargs=2, type=int, default=None,
+                metavar=("START", "END"),
+                help="Ingest a contiguous range of player IDs inclusive, e.g. --player-id-range 0 3500")
+
     ap.add_argument("--splits", action="store_true", help="Scrape batting splits")
     ap.add_argument("--pitching", action="store_true", help="Scrape pitching season stats")
     ap.add_argument("--pitching-splits", action="store_true", help="Scrape pitching splits (platoon + situational)")
@@ -1513,15 +1517,95 @@ def main() -> None:
     ap.add_argument("--discover-rosters", action="store_true", help="Discover player IDs from each team's ML roster page")
     ap.add_argument("--roster-teams", nargs="*", default=None, help="Optional subset of team abbrevs for roster discovery")
     ap.add_argument("--discover-seeds", nargs="*", default=None)
+    ap.add_argument(
+        "--discover-id-range",
+        nargs=2,
+        type=int,
+        default=None,
+        metavar=("START", "END"),
+        help="Probe player IDs in [START..END] and add 'real' ones to player_ids.",
+    )
+    ap.add_argument(
+        "--discover-id-sleep",
+        type=float,
+        default=0.05,
+        help="Sleep between discover-id-range requests (seconds).",
+    )
+
+
 
     ap.add_argument("--ingest-all", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--start-at", type=int, default=0)
 
     args = ap.parse_args()
+    
+    if args.player_id_range:
+        lo, hi = args.player_id_range
+        lo = int(lo)
+        hi = int(hi)
+        if hi < lo:
+            ap.error("player-id-range END must be >= START")
+        args.players = list(range(lo, hi + 1))
+
 
     conn = db_connect(args.db)
     fetcher = Fetcher(timeout=args.timeout, sleep=args.sleep)
+
+    if args.discover_id_range:
+        lo, hi = [int(x) for x in args.discover_id_range]
+        if hi < lo:
+            ap.error("discover-id-range END must be >= START")
+
+        found = 0
+        checked = 0
+
+        for pid in range(lo, hi + 1):
+            checked += 1
+            try:
+                fields, seasons_bat = scrape_player_card(fetcher, pid)
+
+                name = str(fields.get("name") or "").strip()
+                team = str(fields.get("team") or "").strip()
+                bats = str(fields.get("bats") or "").strip()
+                throws = str(fields.get("throws") or "").strip()
+
+                # Filter out known bogus parse artifacts from blank placeholder pages
+                bogus_names = {"minor league baseball club"}
+                bogus_bats = {"throws"}   # header text mis-read as value
+                bogus_throws = {"ml"}     # mis-read fragment
+
+                is_real = bool(name) and (name.lower() not in bogus_names)
+
+                # Require at least one meaningful identity field besides the bogus defaults
+                if team:
+                    pass
+                elif bats and bats.lower() not in bogus_bats:
+                    pass
+                elif throws and throws.lower() not in bogus_throws:
+                    pass
+                else:
+                    is_real = False
+
+                if is_real:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO player_ids(player_id) VALUES(?)",
+                        (int(pid),),
+                    )
+                    conn.commit()
+                    found += 1
+                    if found % 50 == 0:
+                        print(f"[discover-id-range] found={found} (latest pid={pid} name={name})", flush=True)
+
+
+            except Exception:
+                pass
+
+            if args.discover_id_sleep:
+                time.sleep(float(args.discover_id_sleep))
+
+    print(f"[discover-id-range] checked={checked} found={found}", flush=True)
+
 
 
     if args.discover_rosters:
