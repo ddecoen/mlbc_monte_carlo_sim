@@ -150,6 +150,8 @@ def resolve_team_full(conn: sqlite3.Connection, team_raw: Optional[str]) -> Opti
 def resolve_stadium_for_team_year(conn: sqlite3.Connection, team_any: Optional[str], season_year: int) -> Optional[str]:
     if not team_any:
         return None
+
+    # 1) Preferred: a lease row that explicitly covers the year
     try:
         r = conn.execute(
             """
@@ -164,7 +166,7 @@ def resolve_stadium_for_team_year(conn: sqlite3.Connection, team_any: Optional[s
         if r and r["stadium"]:
             return str(r["stadium"])
     except sqlite3.OperationalError:
-        return None
+        pass
 
     try:
         r = conn.execute(
@@ -180,9 +182,45 @@ def resolve_stadium_for_team_year(conn: sqlite3.Connection, team_any: Optional[s
         if r and r["stadium"]:
             return str(r["stadium"])
     except sqlite3.OperationalError:
-        return None
+        pass
+
+    # 2) Fallback: if lease expired, assume team stays until it moves
+    try:
+        r = conn.execute(
+            """
+            SELECT stadium
+            FROM team_stadiums
+            WHERE team = ?
+              AND COALESCE(since_year, 0) <= ?
+            ORDER BY COALESCE(since_year, 0) DESC
+            LIMIT 1
+            """,
+            (team_any, season_year),
+        ).fetchone()
+        if r and r["stadium"]:
+            return str(r["stadium"])
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        r = conn.execute(
+            """
+            SELECT stadium
+            FROM team_stadiums
+            WHERE team = ? COLLATE NOCASE
+              AND COALESCE(since_year, 0) <= ?
+            ORDER BY COALESCE(since_year, 0) DESC
+            LIMIT 1
+            """,
+            (team_any, season_year),
+        ).fetchone()
+        if r and r["stadium"]:
+            return str(r["stadium"])
+    except sqlite3.OperationalError:
+        pass
 
     return None
+
 
 
 # -----------------------------
